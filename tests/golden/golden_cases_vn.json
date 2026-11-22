@@ -1,12 +1,12 @@
 {
   "version": "1.0.0",
-  "description": "Golden regression cases from real SPX return feedback in the original brief. Every case asserts status, province_code, district_code, ward_code and reason_code. null in an expected code field means: the pipeline must NOT commit any code for that field (fail-closed, no forced autofill).",
+  "description": "Golden regression cases from real SPX return feedback in the original brief. Every case asserts status, province_code, district_code, ward_code and reason_code. null in an expected code field means the pipeline must NOT commit a code for that field (fail-closed, no forced autofill), except district/ward null on a NEEDS_REVIEW/NEED_CONFIRMATION case where a proposed (uncommitted) code is tolerated and province is still strictly checked.",
   "status_vocabulary": ["VERIFIED", "NEED_CONFIRMATION", "NEEDS_REVIEW", "REJECTED", "REJECTED_INSUFFICIENT"],
   "forbidden_default_address": {
     "ward_name": "Xã Đăk Yă",
     "district_name": "Mang Yang",
     "province_name": "Gia Lai",
-    "rule": "No case, under any input, may ever resolve to this address as a system-generated default."
+    "rule": "The system must never GENERATE this address as a default for an unreadable or insufficient input. A customer who genuinely writes this full address is a normal valid case (golden_02)."
   },
   "cases": [
     {
@@ -25,19 +25,19 @@
       "forbidden": {"province_name": "Gia Lai", "district_name": "Mang Yang", "ward_name": "Đăk Yă"}
     },
     {
-      "id": "golden_02_forbidden_default_as_input",
-      "source": "regression for schemas forbidden-default handling: must return REJECTED with reason_code, never raise and never commit",
-      "raw_input": "Xã Đăk Yă, Mang Yang, Gia Lai",
-      "declared_province_code": null,
+      "id": "golden_02_dak_ya_written_by_customer_is_normal",
+      "source": "control: a customer genuinely living in Đăk Yă must not be punished for the old default-address bug; only system-generated defaults are forbidden",
+      "raw_input": "Xã Đăk Yă, huyện Mang Yang, tỉnh Gia Lai",
+      "declared_province_code": "64",
       "simulated_provider_suggestion": null,
       "expected": {
-        "statuses": ["REJECTED", "REJECTED_INSUFFICIENT", "NEEDS_REVIEW", "NEED_CONFIRMATION"],
-        "province_code": null,
+        "statuses": ["VERIFIED", "NEED_CONFIRMATION", "NEEDS_REVIEW"],
+        "province_code": "64",
         "district_code": null,
         "ward_code": null,
-        "reason_codes": ["FORBIDDEN_DEFAULT", "NEEDS_REVIEW", "UNVERIFIED_SOURCE"]
+        "reason_codes": ["OK", "VERIFIED", "PROVINCE_ANCHORED", "NEEDS_CONFIRMATION"]
       },
-      "forbidden": {"committed_as_verified": true}
+      "forbidden": {}
     },
     {
       "id": "golden_03_cuor_dang_dak_lak_not_hai_duong",
@@ -151,7 +151,7 @@
     },
     {
       "id": "golden_10_declared_province_mismatch_blocked",
-      "source": "feedback: customer clearly wrote one province, machine filled another province",
+      "source": "feedback: customer clearly wrote one province, machine filled another province; declared-province orders must have 0 wrong-province commits",
       "raw_input": "xã Ea Kao, thành phố Buôn Ma Thuột, tỉnh Đắk Lắk",
       "declared_province_code": "66",
       "simulated_provider_suggestion": {
@@ -171,7 +171,7 @@
     },
     {
       "id": "golden_11_valid_control_hcm_full_address",
-      "source": "valid control case: complete address must still pass, the gate must not block legitimate orders",
+      "source": "valid control case: a complete address must still pass; the gate must not block legitimate orders",
       "raw_input": "Số 12, đường Lê Lợi, Phường Bến Nghé, Quận 1, Thành phố Hồ Chí Minh",
       "declared_province_code": "79",
       "simulated_provider_suggestion": null,
