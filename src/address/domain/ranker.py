@@ -14,6 +14,8 @@ Sau fix:
     (dùng id riêng) để không vô tình loại ứng viên chưa resolve.
   - Margin tính với xã KHÁC tiếp theo; chỉ có một xã duy nhất thì
     margin = điểm của nó (như gốc).
+  - Margin được làm tròn 4 chữ số thập phân: 1.0 - 0.9 trong float là
+    0.09999999999999998, không bằng 0.1 nếu so sánh == trực tiếp.
   - API không đổi: RankedResult(ranked, top1, top2, margin), Ranker.rank.
 """
 from __future__ import annotations
@@ -46,4 +48,4 @@ class Ranker:
         kept = sorted(by_ward.values(), key=lambda c: c.rank_score, reverse=True)
         top1=kept[0] if kept else None; top2=kept[1] if len(kept)>1 else None
         margin=(top1.rank_score-top2.rank_score) if top1 and top2 else (top1.rank_score if top1 else 0.0)
-        return RankedResult(ranked=kept,top1=top1,top2=top2,margin=max(0.0,margin))
+        return RankedResult(ranked=kept,top1=top1,top2=top2,margin=round(max(0.0,margin), 4))
