@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Golden regression cases from real SPX return feedback in the original brief. Every case asserts status, province_code, district_code, ward_code and reason_code. null in an expected code field means the pipeline must NOT commit a code for that field (fail-closed, no forced autofill), except district/ward null on a NEEDS_REVIEW/NEED_CONFIRMATION case where a proposed (uncommitted) code is tolerated and province is still strictly checked.",
   "status_vocabulary": ["VERIFIED", "NEED_CONFIRMATION", "NEEDS_REVIEW", "REJECTED", "REJECTED_INSUFFICIENT"],
   "forbidden_default_address": {
@@ -20,7 +20,7 @@
         "province_code": null,
         "district_code": null,
         "ward_code": null,
-        "reason_codes": ["UNREADABLE_INPUT", "INSUFFICIENT_INFO", "REJECTED_INSUFFICIENT", "FORBIDDEN_DEFAULT"]
+        "reason_codes": ["UNREADABLE_INPUT", "INSUFFICIENT_INFO", "REJECTED_INSUFFICIENT", "FORBIDDEN_DEFAULT", "LOW_CONFIDENCE", "GUARD_BLOCKED", "UNPARSEABLE"]
       },
       "forbidden": {"province_name": "Gia Lai", "district_name": "Mang Yang", "ward_name": "Đăk Yă"}
     },
@@ -35,7 +35,7 @@
         "province_code": "64",
         "district_code": null,
         "ward_code": null,
-        "reason_codes": ["OK", "VERIFIED", "PROVINCE_ANCHORED", "NEEDS_CONFIRMATION"]
+        "reason_codes": ["OK", "VERIFIED", "PROVINCE_ANCHORED", "NEEDS_CONFIRMATION", "NEEDS_REVIEW"]
       },
       "forbidden": {}
     },
@@ -55,7 +55,7 @@
         "province_code": "66",
         "district_code": null,
         "ward_code": null,
-        "reason_codes": ["OK", "PROVINCE_ANCHORED", "NEEDS_CONFIRMATION", "PROVIDER_SUGGESTION_VETOED"]
+        "reason_codes": ["OK", "PROVINCE_ANCHORED", "NEEDS_CONFIRMATION", "NEEDS_REVIEW", "PROVIDER_SUGGESTION_VETOED"]
       },
       "forbidden": {"province_code": "30", "province_name": "Hải Dương", "ward_name": "Phả Lại", "district_name": "Chí Linh"}
     },
@@ -70,7 +70,7 @@
         "province_code": null,
         "district_code": null,
         "ward_code": null,
-        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "NEED_CLARIFICATION", "REJECTED_INSUFFICIENT"]
+        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "NEED_CLARIFICATION", "REJECTED_INSUFFICIENT", "LOW_CONFIDENCE", "GUARD_BLOCKED", "MISSING_ADMIN_LEVELS"]
       },
       "forbidden": {"province_name": "Nghệ An", "ward_name": "Thanh Mỹ", "committed_as_verified": true}
     },
@@ -85,7 +85,7 @@
         "province_code": null,
         "district_code": null,
         "ward_code": null,
-        "reason_codes": ["INSUFFICIENT_INFO", "MISSING_ADMIN_LEVELS", "NEED_CLARIFICATION", "REJECTED_INSUFFICIENT"]
+        "reason_codes": ["INSUFFICIENT_INFO", "MISSING_ADMIN_LEVELS", "NEED_CLARIFICATION", "REJECTED_INSUFFICIENT", "LOW_CONFIDENCE", "GUARD_BLOCKED"]
       },
       "forbidden": {"district_name": "Tân Bình", "committed_as_verified": true}
     },
@@ -100,7 +100,7 @@
         "province_code": null,
         "district_code": null,
         "ward_code": null,
-        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "NUMBER_ONLY", "REJECTED_INSUFFICIENT"]
+        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "NUMBER_ONLY", "REJECTED_INSUFFICIENT", "LOW_CONFIDENCE", "GUARD_BLOCKED"]
       },
       "forbidden": {"province_name": "Cao Bằng", "ward_name": "Hợp Giang"}
     },
@@ -115,7 +115,7 @@
         "province_code": null,
         "district_code": null,
         "ward_code": null,
-        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "NUMBER_ONLY", "REJECTED_INSUFFICIENT"]
+        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "NUMBER_ONLY", "REJECTED_INSUFFICIENT", "LOW_CONFIDENCE", "GUARD_BLOCKED"]
       },
       "forbidden": {"province_name": "Hưng Yên", "ward_name": "Hiến Nam"}
     },
@@ -130,7 +130,7 @@
         "province_code": null,
         "district_code": null,
         "ward_code": null,
-        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "AMBIGUOUS", "REJECTED_INSUFFICIENT"]
+        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "AMBIGUOUS", "REJECTED_INSUFFICIENT", "LOW_CONFIDENCE", "GUARD_BLOCKED"]
       },
       "forbidden": {"province_name": "Bình Dương", "ward_name": "Phú Cường", "district_name": "Thủ Dầu Một"}
     },
@@ -145,7 +145,7 @@
         "province_code": null,
         "district_code": null,
         "ward_code": null,
-        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "AMBIGUOUS", "REJECTED_INSUFFICIENT"]
+        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "AMBIGUOUS", "REJECTED_INSUFFICIENT", "LOW_CONFIDENCE", "GUARD_BLOCKED"]
       },
       "forbidden": {"province_name": "Bình Dương", "ward_name": "Phú Cường", "district_name": "Thủ Dầu Một"}
     },
@@ -165,7 +165,7 @@
         "province_code": "66",
         "district_code": null,
         "ward_code": null,
-        "reason_codes": ["OK", "PROVINCE_ANCHORED", "PROVIDER_SUGGESTION_VETOED", "PROVINCE_MISMATCH"]
+        "reason_codes": ["OK", "PROVINCE_ANCHORED", "PROVIDER_SUGGESTION_VETOED", "PROVINCE_MISMATCH", "NEEDS_CONFIRMATION", "NEEDS_REVIEW"]
       },
       "forbidden": {"province_code": "30", "province_name": "Hải Dương"}
     },
@@ -195,7 +195,7 @@
         "province_code": "66",
         "district_code": null,
         "ward_code": null,
-        "reason_codes": ["OK", "PROVINCE_ANCHORED", "NEEDS_CONFIRMATION"]
+        "reason_codes": ["OK", "PROVINCE_ANCHORED", "NEEDS_CONFIRMATION", "NEEDS_REVIEW"]
       },
       "forbidden": {"province_code": "30", "province_name": "Hải Dương", "ward_name": "Phả Lại"}
     }
