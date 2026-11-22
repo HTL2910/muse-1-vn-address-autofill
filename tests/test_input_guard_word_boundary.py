@@ -2,8 +2,14 @@
 
 Tên hành chính chỉ được tính khi khớp theo ranh giới từ trong một đoạn,
 sau khi loại cụm đường/số nhà — không được tính bằng substring.
+Đồng thời check() phải nhận được ParsedAddress làm đối số thứ hai như
+AddressService.resolve gọi: guard.check(raw_input, parsed).
 """
 from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
 
 from src.address.domain.input_guard import GuardDecision, InputGuard
 
@@ -11,9 +17,49 @@ from src.address.domain.input_guard import GuardDecision, InputGuard
 def _guard():
     return InputGuard(
         known_provinces=["Đắk Lắk", "Hồ Chí Minh", "Thành phố Hồ Chí Minh"],
-        known_districts=["Krông Búk", "Quận 1"],
+        known_districts=["Krông Búk", "Cư M'gar", "Quận 1"],
         known_wards=["Cuôr Đăng", "Bến Nghé"],
     )
+
+
+def _parsed_cuor_dang():
+    return SimpleNamespace(
+        raw_input="127 Nguyễn Trãi, xã Cuôr Đăng, huyện Cư M'gar, tỉnh Đắk Lắk",
+        house_number="127", street="Nguyễn Trãi",
+        ward_name="Cuôr Đăng", district_name="Cư M'gar", province_name="Đắk Lắk",
+        ward_code="66401", district_code="664", province_code="66",
+    )
+
+
+def test_check_accepts_parsed_as_second_positional_arg():
+    """Hồi quy TypeError ở AddressService: check(raw, parsed) không được lỗi."""
+    result = _guard().check(
+        "127 Nguyễn Trãi, xã Cuôr Đăng, huyện Cư M'gar, tỉnh Đắk Lắk",
+        _parsed_cuor_dang(),
+    )
+    assert result.decision == GuardDecision.PASS
+    assert result.allow_waybill is True
+    assert result.call_geocoder is True
+
+
+def test_check_accepts_parsed_as_keyword_arg():
+    result = _guard().check(
+        "127 Nguyễn Trãi, xã Cuôr Đăng, huyện Cư M'gar, tỉnh Đắk Lắk",
+        parsed=_parsed_cuor_dang(),
+    )
+    assert result.decision == GuardDecision.PASS
+
+
+def test_parsed_street_name_misparsed_as_ward_does_not_count():
+    """parsed.ward_name='Lam Sơn' không có trong known_wards thì không tính xã."""
+    parsed = SimpleNamespace(
+        ward_name="Lam Sơn", district_name=None, province_name=None,
+        ward_code=None, district_code=None, province_code=None,
+    )
+    result = _guard().check("Sói 799, đường Lam Sơn", parsed)
+    assert result.decision == GuardDecision.NEED_CLARIFICATION
+    assert "ward" not in result.detected_levels
+    assert result.allow_waybill is False
 
 
 def test_street_name_containing_province_does_not_count():

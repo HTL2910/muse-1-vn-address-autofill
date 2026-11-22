@@ -32,6 +32,16 @@ Sau fix:
   - Nếu không inject danh sách tên chuẩn (known_* rỗng), giữ fallback
     nhận diện tiền tố hành chính bằng regex có \\b (đã là ranh giới từ),
     để các caller cũ không bị vỡ.
+
+Tương thích interface (fix TypeError ở AddressService):
+  AddressService.resolve gọi `guard.check(raw_input, parsed)` với
+  `parsed` là ParsedAddress. Vì vậy `check` PHẢI nhận đối số thứ hai
+  `parsed=None` (cả dạng positional và keyword), và chấp nhận thêm
+  *args/**kwargs để không vỡ khi caller truyền thêm tham số. Mức đã
+  parse được tính thêm, nhưng chỉ khi tên parse khớp đúng tên chuẩn
+  của ĐÚNG cấp đó (token tuple bằng nhau), không substring — ví dụ
+  parsed.ward_name="Lam Sơn" (tên đường bị parse nhầm thành xã) sẽ
+  không được tính là xã nếu "Lam Sơn" không có trong known_wards.
 """
 from __future__ import annotations
 
@@ -39,7 +49,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 __all__ = ["GuardDecision", "GuardResult", "InputGuard", "guard_address_input"]
 
@@ -185,6 +195,22 @@ def _known_token_tuples(names: Sequence[str]) -> set[tuple[str, ...]]:
     return out
 
 
+def _get_parsed_field(parsed: Any, *names: str) -> Optional[Any]:
+    if parsed is None:
+        return None
+    if isinstance(parsed, dict):
+        for n in names:
+            value = parsed.get(n)
+            if value not in (None, ""):
+                return value
+        return None
+    for n in names:
+        value = getattr(parsed, n, None)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 class InputGuard:
     """Guard thuần domain. known_provinces / known_wards là tên chuẩn
     (có dấu, sẽ được chuẩn hóa nội bộ) từ Canonical Admin DB, inject từ
@@ -233,7 +259,54 @@ class InputGuard:
             return self._detect_levels_by_name(raw)
         return self._detect_levels_by_prefix(raw)
 
-    def check(self, raw: Optional[str]) -> GuardResult:
+    def _levels_from_parsed(self, parsed: Any) -> set[str]:
+        """Mức đã parse có cấu trúc (AddressService truyền parsed làm đối
+        số thứ hai). Chỉ tính khi:
+          - có mã hành chính (province_code/district_code/ward_code), hoặc
+          - tên parse khớp ĐÚNG tên chuẩn của ĐÚNG cấp đó (token tuple
+            bằng nhau, không substring), hoặc
+          - không có danh sách tên chuẩn thì parser đã tách đoạn sẵn nên
+            tên parse khác rỗng được tính.
+        Tên đường bị parse nhầm thành xã (vd. ward_name='Lam Sơn' trong
+        khi known_wards không chứa 'Lam Sơn') sẽ KHÔNG được tính."""
+        if parsed is None:
+            return set()
+        found: set[str] = set()
+        if _get_parsed_field(parsed, "province_code"):
+            found.add("province")
+        if _get_parsed_field(parsed, "district_code"):
+            found.add("district")
+        if _get_parsed_field(parsed, "ward_code"):
+            found.add("ward")
+        for level, name_keys in (
+            ("province", ("province_name", "province")),
+            ("district", ("district_name", "district")),
+            ("ward", ("ward_name", "ward")),
+        ):
+            if level in found:
+                continue
+            name = _get_parsed_field(parsed, *name_keys)
+            if not name:
+                continue
+            if not self._has_known_names:
+                found.add(level)
+                continue
+            tokens = _tokens(str(name))
+            if not tokens:
+                continue
+            tuples = self._known[level]
+            if tuple(tokens) in tuples or tuple(_strip_admin_prefix(tokens)) in tuples:
+                found.add(level)
+        return found
+
+    def check(self, raw: Optional[str] = None, parsed: Any = None,
+              *args: Any, **kwargs: Any) -> GuardResult:
+        # Tương thích mọi caller: check(raw), check(raw, parsed),
+        # check(raw, parsed=parsed), check(raw_input=..., parsed=...).
+        if raw is None:
+            raw = kwargs.get("raw_input") or kwargs.get("raw") or ""
+        if parsed is None:
+            parsed = kwargs.get("parsed_address") or (args[0] if args else None)
         text = (raw or "").strip()
         if not text:
             return GuardResult(GuardDecision.NEED_CLARIFICATION, raw or "",
@@ -264,7 +337,9 @@ class InputGuard:
                                missing_fields=("ward", "district", "province"))
         # 4. Chỉ có số nhà + đường, thiếu cấp hành chính:
         #    "Sói 799, đường Lam Sơn" (Sói = gõ sai của Số) -> chặn.
-        levels = self._detect_levels(text)
+        #    Mức = hợp của mức nhận diện từ raw (ranh giới từ) và mức
+        #    đã parse (khớp tên chuẩn đúng cấp).
+        levels = self._detect_levels(text) | self._levels_from_parsed(parsed)
         has_street = bool(re.search(r"\b(duong|đường)\b", norm)) or bool(re.search(r"\d+", text))
         if has_street and len(levels) == 0:
             return GuardResult(GuardDecision.NEED_CLARIFICATION, text, "street_only_no_admin",
@@ -285,6 +360,11 @@ class InputGuard:
                            call_geocoder=True, allow_waybill=True)
 
 
-def guard_address_input(raw: Optional[str], **kwargs) -> GuardResult:
+def guard_address_input(raw: Optional[str] = None, parsed: Any = None,
+                        *args: Any, **kwargs: Any) -> GuardResult:
     """Hàm tiện ích cho API/service: gọi trước mọi bước autofill."""
-    return InputGuard(**kwargs).check(raw)
+    return InputGuard(**{k: v for k, v in kwargs.items()
+                         if k in ("known_provinces", "known_districts", "known_wards")}).check(
+        raw, parsed, *args,
+        **{k: v for k, v in kwargs.items()
+           if k not in ("known_provinces", "known_districts", "known_wards")})

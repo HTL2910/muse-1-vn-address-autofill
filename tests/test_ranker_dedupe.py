@@ -8,6 +8,7 @@ vẫn giữ nguyên margin top1 - top2.
 """
 from __future__ import annotations
 
+import pytest
 from types import SimpleNamespace
 
 from src.address.domain.ranker import Ranker
@@ -53,7 +54,8 @@ def test_distinct_wards_keep_real_margin():
     assert len(result.ranked) == 2
     assert result.top1.address.ward_code == "76002"
     assert result.top2.address.ward_code == "76003"
-    assert result.margin == 0.1
+    # 1.0 - 0.9 trong float là 0.09999999999999998, không so == trực tiếp.
+    assert result.margin == pytest.approx(0.1)
 
 
 def test_province_mismatch_still_vetoed():
