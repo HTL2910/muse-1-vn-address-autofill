@@ -1,9 +1,8 @@
 """Address Contract duy nhất — approach_01, canonical cho fix_missing_pipeline_core.
 
-Mọi module parser, anchor, matcher, ranker, validator, gate đều giao
-tiếp qua contract này. Không raise cho lỗi nghiệp vụ: địa chỉ cấm,
-thiếu cấp, sai phân cấp đều trả về bằng status + reason_code, không
-làm sập pipeline. Chỉ validate định dạng mã và lat/lng bằng exception.
+Mọi module parser, anchor, gate, validator, ranker đều giao tiếp qua
+contract này. Không raise cho lỗi nghiệp vụ: địa chỉ cấm, thiếu cấp,
+sai phân cấp đều trả về bằng status + reason_code, không làm sập pipeline.
 """
 from __future__ import annotations
 
@@ -121,8 +120,6 @@ class AddressContract:
     unmatched_tokens: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        # Chỉ lỗi định dạng mới raise. Lỗi nghiệp vụ (default cấm,
-        # thiếu cấp) được biểu diễn bằng status/reason_code.
         if self.province_code and not PROVINCE_CODE_RE.match(self.province_code):
             raise ValueError(f"Invalid province_code: {self.province_code}")
         if self.district_code and not DISTRICT_CODE_RE.match(self.district_code):
@@ -207,7 +204,6 @@ class PipelineResult:
     def reject(self, stage: PipelineStage, reason: ReasonCode) -> "PipelineResult":
         self.stage_reached = stage
         self.stage_errors[stage.value] = reason.value
-        # replace() không raise cho default cấm — lỗi nghiệp vụ trả về status.
         self.contract = replace(self.contract, status=AddressStatus.REJECTED,
                                 reason_code=reason, confidence=0.0)
         return self
