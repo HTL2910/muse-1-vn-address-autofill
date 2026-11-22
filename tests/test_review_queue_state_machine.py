@@ -55,7 +55,7 @@ def test_state_machine_blocks_double_approve_and_wrong_state():
         q.approve(yellow.id, "cs-b")  # terminal: second approve is an error
     red = q.enqueue(_item("ORD-R", confidence=0.40))
     with pytest.raises(InvalidTransitionError):
-        q.approve(red.id, "cs-a")  # WAITING_CUSTOMER cannot be CS-approved directly
+        q.approve(red.id, "cs-a")  # WAITING_CUSTOMER: CS cannot short-circuit the customer
 
 
 def test_reject_to_customer_and_sla_escalation():
@@ -74,16 +74,22 @@ def test_reject_to_customer_and_sla_escalation():
 def test_optimistic_concurrency_and_persistence(tmp_path):
     db = str(tmp_path / "review.db")
     q1 = ReviewQueue.with_sqlite(db)
-    yellow = q1.enqueue(_item("ORD-Y"))
-    with pytest.raises(ConcurrencyError):
-        q1.approve(yellow.id, "cs-a", expected_version=yellow.version + 99)
-    approved = q1.approve(yellow.id, "cs-a", expected_version=yellow.version)
-    assert approved.version == yellow.version + 1
-    # A brand-new queue over the same DB file still sees the decision:
-    # the store is the source of truth, not process memory.
-    q2 = ReviewQueue.with_sqlite(db)
-    loaded = q2.get_by_order("ORD-Y")
-    assert loaded is not None and loaded.status == ReviewStatus.APPROVED
+    q2 = None
+    try:
+        yellow = q1.enqueue(_item("ORD-Y"))
+        with pytest.raises(ConcurrencyError):
+            q1.approve(yellow.id, "cs-a", expected_version=yellow.version + 99)
+        approved = q1.approve(yellow.id, "cs-a", expected_version=yellow.version)
+        assert approved.version == yellow.version + 1
+        # A brand-new queue over the same DB file still sees the decision:
+        # the store is the source of truth, not process memory.
+        q2 = ReviewQueue.with_sqlite(db)
+        loaded = q2.get_by_order("ORD-Y")
+        assert loaded is not None and loaded.status == ReviewStatus.APPROVED
+    finally:
+        q1.close()
+        if q2 is not None:
+            q2.close()
 
 
 def test_customer_confirmed_cross_province_is_not_approved():
@@ -129,7 +135,7 @@ def test_fix_token_required_wrong_and_expired():
     with pytest.raises(InvalidTokenError):
         q.customer_confirmed(red.id, valid, token="wrong-token")
     with pytest.raises(InvalidTokenError):
-        q.customer_confirmed(red.id, valid)  # missing token
+        q.customer_confirmed(red.id, valid)  # missing token in enforced mode
     now[0] += ReviewQueue.FIX_TOKEN_TTL_SECONDS + 1
     with pytest.raises(InvalidTokenError):
         q.customer_confirmed(red.id, valid, token=token)  # expired

@@ -1,6 +1,6 @@
 """
 Risk-tiered manual review queue - approach_15
-Fix: fix_review_queue_state_machine
+Fix: fix_review_queue_state_machine (round 2)
 
 Kept from the original: risk tiers (GREEN auto, YELLOW 1-click CS,
 RED hold + ask customer), thresholds 0.90 / 0.65, SLA (YELLOW 15 min,
@@ -16,13 +16,18 @@ What this fix changes:
    `version`; a stale writer gets ConcurrencyError instead of silently
    overwriting another CS agent's decision. Items survive a queue /
    process restart whenever the store is file-backed.
-2. Explicit state machine. Allowed transitions are declared in
-   TRANSITIONS; anything else raises InvalidTransitionError. APPROVED
-   and AUTO_APPROVED are terminal - approving twice is an error, not a
-   second metrics sample.
+2. Explicit state machine, per actor. CS approve/reject is only legal
+   from PENDING_CS or ESCALATED; customer confirmation is only legal
+   from WAITING_CUSTOMER / ESCALATED / PENDING_CS; APPROVED and
+   AUTO_APPROVED are terminal. Anything else raises
+   InvalidTransitionError - approving twice is an error, not a second
+   metrics sample.
 3. customer_confirmed() RE-VALIDATES before it can approve:
-   - the one-tap token must match the token issued for THIS order
-     (only its HMAC hash is stored) and must not be expired;
+   - the one-tap token: in production mode (token_secret configured)
+     a token is mandatory, only its HMAC hash is stored, it is bound
+     to this order and expires; whenever a token IS supplied it is
+     always verified. Without a secret (internal/CS-driven flows and
+     tests) the token is optional, because no link was ever issued.
    - the confirmed province must equal the anchored province;
    - the injected validator (HierarchicalValidator or any duck-typed
      validate_dict / callable) must not return BLOCKED, and the gate
@@ -33,9 +38,8 @@ What this fix changes:
    A failed re-validation leaves the item WAITING_CUSTOMER with
    last_validation_errors recorded so the customer can retry - it is
    never approved and never silently dropped.
-4. The fix link sent to the customer carries the one-tap token
-   (messengers that do not accept a token argument are called with the
-   original signature).
+4. Intake stamps created_at with the queue clock, so SLA math compares
+   one consistent time source.
 
 Status: chua chay - CI se bao ket qua.
 """
@@ -70,7 +74,7 @@ class ReviewStatus(str, Enum):
 
 
 class InvalidTransitionError(ValueError):
-    """Raised when a status transition is not in TRANSITIONS."""
+    """Raised when a status transition is not allowed for that actor."""
 
 
 class ConcurrencyError(RuntimeError):
@@ -78,10 +82,11 @@ class ConcurrencyError(RuntimeError):
 
 
 class InvalidTokenError(ValueError):
-    """Raised when a one-tap fix token is missing, wrong, or expired."""
+    """Raised when a one-tap fix token is wrong or expired, or is
+    missing while the queue runs in token-enforced (secret) mode."""
 
 
-# State machine: current status -> statuses it may move to.
+# State machine: current status -> statuses it may move to (any actor).
 TRANSITIONS: Dict[ReviewStatus, frozenset] = {
     ReviewStatus.PENDING_CS: frozenset({
         ReviewStatus.APPROVED, ReviewStatus.WAITING_CUSTOMER,
@@ -97,6 +102,11 @@ TRANSITIONS: Dict[ReviewStatus, frozenset] = {
     ReviewStatus.AUTO_APPROVED: frozenset(),
 }
 TERMINAL_STATUSES = frozenset({ReviewStatus.APPROVED, ReviewStatus.AUTO_APPROVED})
+# Per-actor source states - this is what stops a CS approve from
+# short-circuiting an item that is waiting on the customer.
+CS_ACTION_SOURCES = frozenset({ReviewStatus.PENDING_CS, ReviewStatus.ESCALATED})
+CUSTOMER_CONFIRM_SOURCES = frozenset({
+    ReviewStatus.WAITING_CUSTOMER, ReviewStatus.ESCALATED, ReviewStatus.PENDING_CS})
 
 
 @dataclass
@@ -322,6 +332,9 @@ class InMemoryReviewStore:
         with self._lock:
             return [self._copy(i) for i in sorted(self._items.values(), key=lambda x: x.created_at)]
 
+    def close(self) -> None:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Queue
@@ -351,6 +364,11 @@ class ReviewQueue:
     @classmethod
     def with_sqlite(cls, path: str, **kwargs) -> "ReviewQueue":
         return cls(store=SQLiteReviewStore(path), **kwargs)
+
+    def close(self) -> None:
+        close = getattr(self._store, "close", None)
+        if callable(close):
+            close()
 
     # -- classification -------------------------------------------------------
     def classify(self, item: ReviewItem) -> Tier:
@@ -382,10 +400,17 @@ class ReviewQueue:
         return token
 
     def _verify_fix_token(self, item: ReviewItem, token: Optional[str]) -> None:
-        if not item.fix_token_hash:
-            return  # no token was issued for this item (e.g. CS-driven flow)
+        """A supplied token is ALWAYS verified (hash + expiry). A token
+        is only *required* in token-enforced mode (token_secret set):
+        without a secret no customer link was ever issued, so internal
+        and CS-driven confirmations are not blocked by a token nobody
+        could have received."""
         if not token:
-            raise InvalidTokenError("one-tap fix token is required for this item")
+            if self._token_secret and item.fix_token_hash:
+                raise InvalidTokenError("one-tap fix token is required for this item")
+            return
+        if not item.fix_token_hash:
+            raise InvalidTokenError("no fix token was issued for this item")
         if item.fix_token_expires_at is not None and self._clock() > item.fix_token_expires_at:
             raise InvalidTokenError("one-tap fix token has expired")
         if not hmac.compare_digest(self._hash_token(token), item.fix_token_hash):
@@ -401,8 +426,6 @@ class ReviewQueue:
 
     def _transition(self, item: ReviewItem, new_status: ReviewStatus, action: str) -> ReviewItem:
         if new_status == item.status:
-            # Staying in place (e.g. failed re-validation) is a recorded
-            # action, not a transition.
             item.last_action = action
             return self._persist(item)
         allowed = TRANSITIONS.get(item.status, frozenset())
@@ -412,6 +435,12 @@ class ReviewQueue:
         item.status = new_status
         item.last_action = action
         return self._persist(item)
+
+    def _require_cs_source(self, item: ReviewItem, action: str) -> None:
+        if item.status not in CS_ACTION_SOURCES:
+            raise InvalidTransitionError(
+                f"CS action {action} is not allowed from {item.status.value} "
+                f"(item {item.id}); CS may only act on PENDING_CS or ESCALATED items")
 
     def _get(self, item_id: str) -> ReviewItem:
         item = self._store.get(item_id)
@@ -430,6 +459,7 @@ class ReviewQueue:
         existing = self._store.get_by_order(item.order_id)
         if existing is not None:
             return existing  # UNIQUE(order_id): idempotent intake
+        item.created_at = self._clock()  # SLA is measured from intake, one clock
         item.tier = self.classify(item)
         fix_token: Optional[str] = None
         if item.tier == Tier.GREEN:
@@ -475,6 +505,7 @@ class ReviewQueue:
     def approve(self, item_id: str, cs_user: str,
                 expected_version: Optional[int] = None) -> ReviewItem:
         item = self._get(item_id)
+        self._require_cs_source(item, "approve")
         if expected_version is not None and item.version != expected_version:
             raise ConcurrencyError(
                 f"review item {item_id} version {item.version} != expected {expected_version}")
@@ -485,6 +516,7 @@ class ReviewQueue:
     def reject_to_customer(self, item_id: str, cs_user: str,
                            expected_version: Optional[int] = None) -> ReviewItem:
         item = self._get(item_id)
+        self._require_cs_source(item, "reject_to_customer")
         if expected_version is not None and item.version != expected_version:
             raise ConcurrencyError(
                 f"review item {item_id} version {item.version} != expected {expected_version}")
@@ -553,9 +585,9 @@ class ReviewQueue:
     def customer_confirmed(self, item_id: str, confirmed_address: dict,
                            token: Optional[str] = None) -> ReviewItem:
         item = self._get(item_id)
-        if item.status in TERMINAL_STATUSES:
+        if item.status not in CUSTOMER_CONFIRM_SOURCES:
             raise InvalidTransitionError(
-                f"review item {item_id} is already {item.status.value}")
+                f"customer confirmation is not allowed from {item.status.value} (item {item_id})")
         self._verify_fix_token(item, token)
         confirmed = dict(confirmed_address or {})
 
@@ -578,8 +610,6 @@ class ReviewQueue:
         if errors or v_outcome == "fail" or g_outcome == "fail":
             item.last_validation_errors = errors or v_errors or ["gate_rejected"]
             item.last_action = "customer_confirmed_revalidation_failed"
-            # Stay WAITING_CUSTOMER so the customer can retry; if the item
-            # was escalated, hand it back to the customer flow as well.
             if item.status == ReviewStatus.ESCALATED:
                 return self._transition(item, ReviewStatus.WAITING_CUSTOMER,
                                         "customer_confirmed_revalidation_failed")
