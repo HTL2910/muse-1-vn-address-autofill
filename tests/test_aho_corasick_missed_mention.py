@@ -32,11 +32,12 @@ def test_reprocess_after_fail_aab_ab():
 
 
 def test_classic_ushers():
-    # "she" và "he" kết thúc cùng vị trí, "hers" tiếp nối ngay sau đó.
+    # "ushers": u(0) s(1) h(2) e(3) r(4) s(5).
+    # "she" ở 1-4, "he" ở 2-4, "hers" ở 2-6 (h-e-r-s).
     found = _patterns_found(["he", "she", "his", "hers"], "ushers")
     assert ("she", 1, 4) in found
     assert ("he", 2, 4) in found
-    assert ("hers", 1, 5) in found
+    assert ("hers", 2, 6) in found
     assert ("his", 0, 0) not in found
 
 
@@ -76,6 +77,8 @@ def test_admin_mentions_after_partial_match():
 
 
 def test_admin_mentions_full_address():
+    # "lak" trong "dak lak" không được tính là mention huyện Lắk riêng:
+    # longest-match thắng, huyện chỉ còn Cư M'gar (663).
     mentions = extract_admin_mentions(
         "127 Nguyễn Trãi, xã Cuôr Đăng, huyện Cư M'gar, tỉnh Đắk Lắk", _index())
     assert [u.code for u in mentions["ward"]] == ["66301"]

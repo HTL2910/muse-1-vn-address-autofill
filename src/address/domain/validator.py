@@ -30,7 +30,9 @@ MISSING_HOUSE_OR_STREET chỉ cộng khi cả contract lẫn raw_input đều
 không có số nhà + tên đường. Địa chỉ đúng "Số 12, đường Lê Lợi, ..."
 không được bị trừ điểm chỉ vì một nguồn ứng viên (geocoder/fuzzy)
 làm rơi trường street/house_number khi tạo contract — bằng chứng
-nhà/đường nằm ngay trong raw_input khách viết.
+nhà/đường nằm ngay trong raw_input khách viết. Dấu hiệu được gom trên
+toàn bộ raw_input (số nhà ở đoạn này, tên đường ở đoạn khác) vì địa
+chỉ thật tách chúng ra hai đoạn; "Số 12" đứng một mình vẫn warning.
 
 Fail-closed: any error -> BLOCKED, any warning or penalty ->
 NEEDS_REVIEW, only a fully clean address returns OK.
@@ -90,27 +92,31 @@ def _result_field(obj: Any, *names: str):
 
 
 def _raw_has_house_or_street(raw_input: Optional[str]) -> bool:
-    """True khi raw_input tự nó chứa cả số nhà và tên đường.
+    """True khi raw_input chứa cả số nhà và tên đường (gom trên toàn bộ
+    raw_input, vì địa chỉ thật tách chúng ra hai đoạn: "Số 12" ở đoạn
+    này, "đường Lê Lợi" ở đoạn khác).
 
-    Chỉ nhận khi cùng một đoạn có cả hai dấu hiệu: "Số 12, đường Lê Lợi"
-    hoặc "127 Nguyễn Trãi" (số ở đầu đoạn + ít nhất một từ tên đường).
-    "Số 12" đứng một mình, hay chỉ có tên đường không có số nhà, thì
-    không tính — để không che mất warning cho địa chỉ thiếu thật.
+    Chỉ nhận khi có cả hai dấu hiệu: số nhà ("Số <n>" hoặc đoạn bắt đầu
+    bằng số + tên) VÀ tên đường ("đường"/"ngõ"/"hẻm" + tên, hoặc đoạn
+    bắt đầu bằng số + tên). "Số 12" đứng một mình, hay chỉ có tên
+    đường không có số nhà, thì không tính.
     """
     if not raw_input:
         return False
+    has_number = False
+    has_street = False
     for segment in str(raw_input).split(","):
         seg = segment.strip()
         if not seg:
             continue
         low = seg.lower()
-        if re.search(r"\b(?:đường|duong|ngõ|ngo|hẻm|hem)\b", low) and re.search(r"\d+", seg):
-            return True
+        if re.search(r"\b(?:số|so)\s*\d+\b", low) or re.match(r"^\d+\s+\S+", seg):
+            has_number = True
+        if re.search(r"\b(?:đường|duong|ngõ|ngo|hẻm|hem)\b", low):
+            has_street = True
         if re.match(r"^\d+\s+\S+", seg):
-            return True
-        if re.search(r"\b(?:số|so)\s*\d+\b", low) and re.search(r"\b(?:đường|duong)\b", low):
-            return True
-    return False
+            has_street = True  # "127 Nguyễn Trãi": số + tên đường.
+    return has_number and has_street
 
 
 class HierarchicalValidator:

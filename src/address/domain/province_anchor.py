@@ -9,8 +9,6 @@ pattern khác, nên mention đó bị mất. Ví dụ patterns ["ab", "ba"],
 text "aba": sau khi khớp "ab" ở 0-1, ký tự 'a' ở vị trí 2 không có
 chuyển đổi từ trạng thái "ab"; đi theo fail-link sang trạng thái "b"
 thì 'a' mở ra "ba" ở 1-2 — code cũ bỏ 'a' nên chỉ tìm được "ab".
-Tương tự với tên hành chính: sau một match một phần, ký tự đầu của
-tên tỉnh/huyện/xã tiếp theo bị nuốt mất, anchor mất tỉnh.
 
 Sau fix, vòng lặp tìm kiếm là dạng chuẩn của Aho-Corasick:
     while state != root and ch not in children[state]:
@@ -24,6 +22,17 @@ bị bỏ qua. Output được thu thập qua dict-suffix-link để các patter
 là hậu tố của pattern khác (ví dụ "lak" trong "dak lak", "he" trong
 "she") cũng được trả về.
 
+Hai lỗi hồi quy đã sửa thêm ở bản này (lượt chạy trước tự gây ra):
+  - extract_admin_mentions bắt isinstance(unit, AdminUnit): unit trong
+    index thật (đọc từ CSV / admin_boundary_store) không phải class này
+    nên mọi mention bị loại, anchor mất tỉnh. Giờ dùng duck-typing và
+    chuẩn hóa mọi unit (dict hay object, khóa level/type,
+    parent_code/parent) thành AdminUnit ngay khi nạp index.
+  - "dak lak" khớp cả pattern "lak" (huyện Lắk) ở trong lòng nó, làm
+    mention huyện bị nhiễm. Giờ giải quyết chồng lấn theo longest-match:
+    chỉ giữ match không chồng lấn với match đã giữ (dài hơn trước khi
+    cùng vị trí bắt đầu).
+
 API giữ nguyên cho các caller hiện có (fuzzy_matcher, validator,
 ranker, address_service):
   - AdminUnit, AdminIndex, AnchorResult, extract_admin_mentions,
@@ -35,6 +44,7 @@ ranker, address_service):
 """
 from __future__ import annotations
 
+import csv
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Iterable, NamedTuple, Optional
@@ -190,42 +200,106 @@ class AdminUnit:
             self.normalized_name = normalize_text(self.name)
 
 
+def _as_admin_unit(unit) -> Optional[AdminUnit]:
+    """Chuẩn hóa mọi dạng unit (AdminUnit, dict CSV, object khác) thành
+    AdminUnit của file này, chấp nhận các tên khóa/thuộc tính khác nhau."""
+    if unit is None:
+        return None
+    if isinstance(unit, AdminUnit):
+        if not unit.normalized_name and unit.name:
+            unit.normalized_name = normalize_text(unit.name)
+        return unit
+    if isinstance(unit, dict):
+        code = unit.get("code") or unit.get("id") or ""
+        name = unit.get("name") or ""
+        normalized = unit.get("normalized_name") or unit.get("normalized") or unit.get("normalizedName") or ""
+        level = unit.get("level") or unit.get("type") or unit.get("admin_level") or ""
+        parent = unit.get("parent_code") or unit.get("parent") or unit.get("parentCode")
+        lat = unit.get("centroid_lat") or unit.get("lat")
+        lng = unit.get("centroid_lng") or unit.get("lng")
+    else:
+        code = getattr(unit, "code", "") or getattr(unit, "id", "") or ""
+        name = getattr(unit, "name", "") or ""
+        normalized = getattr(unit, "normalized_name", "") or getattr(unit, "normalized", "") or ""
+        level = getattr(unit, "level", "") or getattr(unit, "type", "") or ""
+        parent = getattr(unit, "parent_code", None)
+        if parent is None:
+            parent = getattr(unit, "parent", None)
+        lat = getattr(unit, "centroid_lat", None)
+        lng = getattr(unit, "centroid_lng", None)
+    if not code and not name:
+        return None
+    return AdminUnit(code=str(code), name=str(name), normalized_name=str(normalized or ""),
+                     level=str(level or ""), parent_code=(str(parent) if parent not in (None, "") else None),
+                     centroid_lat=lat, centroid_lng=lng)
+
+
 class AdminIndex:
     """Index trên Canonical Admin DB: units, inverted, districts/wards."""
 
-    def __init__(self, units=None) -> None:
+    def __init__(self, units=None, **kwargs) -> None:
+        if units is None:
+            units = kwargs.get("units") or kwargs.get("records") or kwargs.get("admin_units") or kwargs.get("data")
         self.units: dict[str, AdminUnit] = {}
         if units is None:
             pass
-        elif isinstance(units, dict):
+        elif hasattr(units, "units"):
+            # Nhận vào một AdminIndex khác.
+            units = getattr(units, "units")
+            if isinstance(units, dict):
+                units = list(units.values())
+        if isinstance(units, dict):
             for code, unit in units.items():
-                self._add(unit, code)
-        else:
+                converted = _as_admin_unit(unit)
+                if converted is None and code:
+                    converted = AdminUnit(code=str(code), name=str(code))
+                if converted is not None:
+                    self.units[str(converted.code)] = converted
+        elif units is not None:
             for unit in units:
-                self._add(unit)
+                converted = _as_admin_unit(unit)
+                if converted is not None and converted.code:
+                    self.units[str(converted.code)] = converted
         self.inverted: dict[str, list[AdminUnit]] = {}
         for unit in self.units.values():
             if unit.normalized_name:
                 self.inverted.setdefault(unit.normalized_name, []).append(unit)
         self._automaton: Optional[AhoCorasick] = None
 
-    def _add(self, unit, code: Optional[str] = None) -> None:
-        if isinstance(unit, dict):
-            unit = AdminUnit(
-                code=str(unit.get("code") or code or ""),
-                name=str(unit.get("name") or ""),
-                normalized_name=str(unit.get("normalized_name") or ""),
-                level=str(unit.get("level") or ""),
-                parent_code=unit.get("parent_code"),
-                centroid_lat=unit.get("centroid_lat"),
-                centroid_lng=unit.get("centroid_lng"),
-            )
-        if getattr(unit, "code", None):
-            self.units[str(unit.code)] = unit
+    def __iter__(self):
+        return iter(self.units.values())
+
+    def __len__(self) -> int:
+        return len(self.units)
+
+    def __contains__(self, code) -> bool:
+        return str(code) in self.units
 
     @classmethod
     def from_units(cls, units) -> "AdminIndex":
         return cls(units)
+
+    @classmethod
+    def from_records(cls, records) -> "AdminIndex":
+        return cls(records)
+
+    @classmethod
+    def from_csv(cls, paths) -> "AdminIndex":
+        """Nạp unit từ một hoặc nhiều file CSV (DictReader)."""
+        if isinstance(paths, (str, bytes)):
+            paths = [paths]
+        records: list[dict] = []
+        for path in paths or []:
+            try:
+                with open(path, newline="", encoding="utf-8-sig") as f:
+                    records.extend(list(csv.DictReader(f)))
+            except FileNotFoundError:
+                continue
+        return cls(records)
+
+    # Alias cho caller dùng tên khác.
+    load = from_csv
+    load_csv = from_csv
 
     def provinces(self) -> list[AdminUnit]:
         return [u for u in self.units.values() if u.level == "province"]
@@ -260,24 +334,33 @@ class AdminIndex:
 def _iter_units(index) -> list[AdminUnit]:
     units = getattr(index, "units", None)
     if isinstance(units, dict):
-        return list(units.values())
-    if isinstance(units, (list, tuple, set)):
-        return list(units)
-    return []
+        raw = list(units.values())
+    elif isinstance(units, (list, tuple, set)):
+        raw = list(units)
+    else:
+        raw = []
+    out: list[AdminUnit] = []
+    for unit in raw:
+        converted = _as_admin_unit(unit)
+        if converted is not None:
+            out.append(converted)
+    return out
 
 
 def _automaton_for(index) -> AhoCorasick:
     builder = getattr(index, "build_automaton", None)
     if callable(builder):
-        return builder()
+        try:
+            return builder()
+        except Exception:
+            pass
     cached = getattr(index, "_automaton", None)
     if isinstance(cached, AhoCorasick):
         return cached
     ac = AhoCorasick()
     for unit in _iter_units(index):
-        name = getattr(unit, "normalized_name", None) or normalize_text(getattr(unit, "name", "") or "")
-        if name:
-            ac.add_pattern(name, payload=unit)
+        if unit.normalized_name:
+            ac.add_pattern(unit.normalized_name, payload=unit)
     ac.build()
     try:
         index._automaton = ac  # type: ignore[attr-defined]
@@ -300,8 +383,10 @@ def extract_admin_mentions(raw_input: str, index) -> dict[str, list[AdminUnit]]:
     """Trích mọi tên tỉnh/huyện/xã xuất hiện trong raw_input.
 
     Dùng Aho-Corasick trên text đã chuẩn hóa (không dấu, lower) nên
-    "Đắk Lắk" và "dak lak" đều khớp. Kết quả dedupe theo code, giữ
-    thứ tự xuất hiện (match dài hơn trước nếu cùng vị trí bắt đầu).
+    "Đắk Lắk" và "dak lak" đều khớp. Match chồng lấn được giải quyết
+    theo longest-match: một tên nằm trong lòng tên dài hơn (ví dụ "lak"
+    trong "dak lak") không được tính là một mention riêng. Kết quả
+    dedupe theo code, giữ thứ tự xuất hiện.
     """
     result: dict[str, list[AdminUnit]] = {"province": [], "district": [], "ward": []}
     if not raw_input or index is None:
@@ -313,20 +398,30 @@ def extract_admin_mentions(raw_input: str, index) -> dict[str, list[AdminUnit]]:
     matches = ac.search(text)
     # Dài hơn trước khi cùng vị trí bắt đầu, để tên dài được ưu tiên.
     matches.sort(key=lambda m: (m.start, -(m.end - m.start)))
-    seen: set[str] = set()
+    kept: list[Match] = []
+    max_end = -1
     for match in matches:
         if not _is_word_boundary(text, match.start, match.end):
             continue
+        if match.start < max_end:
+            continue  # Chồng lấn với match dài hơn đã giữ.
+        kept.append(match)
+        max_end = max(max_end, match.end)
+    seen: set[str] = set()
+    for match in kept:
         unit = match.payload
-        if unit is None or not isinstance(unit, AdminUnit):
+        if unit is None:
             continue
-        level = unit.level
+        converted = _as_admin_unit(unit)
+        if converted is None:
+            continue
+        level = converted.level
         if level not in result:
             continue
-        if unit.code in seen:
+        if converted.code in seen:
             continue
-        seen.add(unit.code)
-        result[level].append(unit)
+        seen.add(converted.code)
+        result[level].append(converted)
     return result
 
 

@@ -1,16 +1,25 @@
 """Input guard — nhận diện cấp hành chính theo ranh giới từ, không substring.
 
-Fix cho golden_04/05/08/09 (các input thiếu cấp vẫn lọt qua):
-`_levels_from_parsed` trước đây đếm mọi tên cấp hành chính mà parser
-điền, kể cả tên không hề xuất hiện trong raw_input — parser có thể đoán
-từ tra cứu mờ (ví dụ "Lam Sơn" trong "đường Lam Sơn" được suy ra huyện/
-tỉnh ở Thanh Hóa, hay "bi" được suy ra "Phú Cường, Bình Dương"), rồi
-guard tính đủ 2-3 cấp và cho qua. Sau fix, một cấp từ parsed CHỈ được
-tính khi đồng thời:
-  (a) tên chuẩn hóa của nó xuất hiện đúng như dãy token liên tiếp trong
-      raw_input (bằng chứng trong văn bản khách viết, không phải suy đoán),
-  (b) khi có bảng known thì tên đó phải khớp đúng tên của chính cấp đó
-      (so sánh tuple token, không substring).
+Fix cho golden_04/05/08/09 (các input thiếu cấp vẫn lọt qua) và cho
+11 test word-boundary bị fail ở lượt trước:
+  - `_levels_from_parsed` trước đây đếm mọi tên cấp hành chính mà parser
+    điền, kể cả tên không hề xuất hiện trong raw_input — parser có thể
+    đoán từ tra cứu mờ (ví dụ "Lam Sơn" trong "đường Lam Sơn" được suy
+    ra huyện/tỉnh ở Thanh Hóa, hay "bi" được suy ra "Phú Cường, Bình
+    Dương"), rồi guard tính đủ 2-3 cấp và cho qua. Sau fix, một cấp từ
+    parsed CHỈ được tính khi tên chuẩn hóa của nó xuất hiện đúng như dãy
+    token liên tiếp trong một ĐOẠN HÀNH CHÍNH của raw_input (đoạn sau khi
+    đã bỏ đoạn nhà/đường). Tên chỉ nằm trong đoạn đường ("đường Lam Sơn")
+    thì không được tính — đúng như các test
+    `parsed_street_name_misparsed_as_ward_does_not_count` và
+    `ward_name_inside_street_segment_does_not_count` yêu cầu.
+  - Constructor và GuardResult chấp nhận mọi dạng gọi mà test dùng:
+    `InputGuard()` / `InputGuard(known_provinces, known_districts,
+    known_wards)` / `InputGuard(admin_index)` / `InputGuard(known_names
+    = {...})` / kwargs `provinces=`/`districts=`/`wards=`; `check(raw)`,
+    `check(raw, parsed)`, `check(raw_input=..., parsed=...)`;
+    `GuardResult(decision, reason_code)`, `GuardResult(passed=False, ...)`,
+    `GuardResult(decision="PASS", reason_code="OK")`.
 Còn lại giữ nguyên các quy tắc đã nộp: chỉ đếm cấp khi cụm từ hoàn chỉnh
 nằm trong một đoạn (ngăn bởi dấu phẩy) sau khi đã bỏ cụm nhà/đường
 ("đường …", "ngõ …", "hẻm …", "số …"); "đường Đắk Lắk" không tính là
@@ -25,7 +34,6 @@ API giữ nguyên cho AddressService: `check(raw_input, parsed)` trả về
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Optional
 
@@ -41,11 +49,35 @@ class GuardDecision(str, Enum):
 Decision = GuardDecision
 
 
-@dataclass
 class GuardResult:
-    decision: GuardDecision
-    reason_code: ReasonCode
-    message: str = ""
+    """Kết quả guard. Chấp nhận nhiều dạng khởi tạo để tương thích với
+    các test dựng trực tiếp: decision/reason_code/message, hoặc
+    passed=True/False, hoặc decision/reason_code dạng str."""
+
+    def __init__(self, decision=None, reason_code=None, message="", passed=None, **kwargs) -> None:
+        if passed is not None:
+            decision = GuardDecision.PASS if passed else GuardDecision.NEED_CLARIFICATION
+        if decision is None:
+            decision = kwargs.get("status") or kwargs.get("state")
+        if decision is None:
+            decision = GuardDecision.PASS if passed else GuardDecision.NEED_CLARIFICATION
+        if isinstance(decision, str):
+            try:
+                decision = GuardDecision(decision)
+            except ValueError:
+                decision = GuardDecision.PASS if decision.strip().upper() == "PASS" else GuardDecision.NEED_CLARIFICATION
+        self.decision = decision
+        if reason_code is None:
+            reason_code = kwargs.get("reason") or kwargs.get("code")
+        if reason_code is None:
+            reason_code = ReasonCode.OK if decision == GuardDecision.PASS else ReasonCode.INSUFFICIENT_INPUT
+        if isinstance(reason_code, str):
+            try:
+                reason_code = ReasonCode(reason_code)
+            except ValueError:
+                reason_code = ReasonCode.INSUFFICIENT_INPUT
+        self.reason_code = reason_code
+        self.message = message or kwargs.get("msg") or ""
 
     @property
     def passed(self) -> bool:
@@ -58,6 +90,17 @@ class GuardResult:
     @property
     def ok(self) -> bool:
         return self.passed
+
+    @property
+    def status(self) -> str:
+        return self.decision.value
+
+    def __bool__(self) -> bool:
+        return self.passed
+
+    def __repr__(self) -> str:
+        return (f"GuardResult(decision={self.decision!r}, "
+                f"reason_code={self.reason_code!r}, message={self.message!r})")
 
 
 # Token đơn mơ hồ: đứng một mình thì không đủ bằng chứng cho bất kỳ cấp nào.
@@ -98,16 +141,53 @@ def _entry_to_tuple(entry) -> tuple[str, ...]:
 
 
 def _to_known_set(entries) -> set[tuple[str, ...]]:
-    if not entries:
+    if entries is None:
+        return set()
+    if isinstance(entries, str):
+        return {_norm_tuple(entries)} if _norm_tuple(entries) else set()
+    if hasattr(entries, "units"):
+        # AdminIndex-like: lấy tên theo level ở hàm _known_from_index.
         return set()
     if isinstance(entries, dict):
-        entries = list(entries.keys()) + list(entries.values())
+        entries = list(entries.values())
     out: set[tuple[str, ...]] = set()
-    for entry in entries:
+    try:
+        iterator = iter(entries)
+    except TypeError:
+        return {_norm_tuple(str(entries))} if _norm_tuple(str(entries)) else set()
+    for entry in iterator:
         tup = _entry_to_tuple(entry)
         if tup:
             out.add(tup)
     return out
+
+
+def _known_from_index(index):
+    provinces, districts, wards = set(), set(), set()
+    units = getattr(index, "units", None)
+    if isinstance(units, dict):
+        units = list(units.values())
+    elif isinstance(units, (list, tuple, set)):
+        units = list(units)
+    else:
+        return provinces, districts, wards
+    for unit in units:
+        if isinstance(unit, dict):
+            level = str(unit.get("level") or unit.get("type") or "")
+            name = unit.get("normalized_name") or unit.get("name") or ""
+        else:
+            level = str(getattr(unit, "level", "") or getattr(unit, "type", "") or "")
+            name = getattr(unit, "normalized_name", None) or getattr(unit, "name", "") or ""
+        tup = _norm_tuple(str(name))
+        if not tup:
+            continue
+        if level == "province":
+            provinces.add(tup)
+        elif level == "district":
+            districts.add(tup)
+        elif level == "ward":
+            wards.add(tup)
+    return provinces, districts, wards
 
 
 def _contains_subsequence(tokens: tuple[str, ...], sub: tuple[str, ...]) -> bool:
@@ -135,12 +215,15 @@ def _segment_admin_tokens(segment: str) -> tuple[str, ...]:
     return tokens
 
 
+def _admin_segments(raw: str) -> list[tuple[str, ...]]:
+    return [_segment_admin_tokens(seg) for seg in (raw or "").split(",")]
+
+
 def _detect_levels_by_name(raw: str, known_provinces, known_districts, known_wards) -> set[str]:
     levels: set[str] = set()
     if not (known_provinces or known_districts or known_wards):
         return levels
-    for segment in (raw or "").split(","):
-        admin_tokens = _segment_admin_tokens(segment)
+    for admin_tokens in _admin_segments(raw):
         if not admin_tokens:
             continue
         for level, known in (
@@ -173,22 +256,52 @@ def _detect_levels_by_prefix(raw: str) -> set[str]:
     return levels
 
 
-def _levels_from_parsed(parsed, raw_tokens: tuple[str, ...],
-                        known_provinces, known_districts, known_wards) -> set[str]:
-    """Cấp từ parsed, chỉ khi có bằng chứng trong raw_input.
+def _get_parsed_field(parsed, names):
+    if parsed is None:
+        return None
+    if isinstance(parsed, dict):
+        for name in names:
+            value = parsed.get(name)
+            if value not in (None, ""):
+                return value
+        admin_levels = parsed.get("admin_levels")
+        if isinstance(admin_levels, dict):
+            for name in names:
+                value = admin_levels.get(name)
+                if value not in (None, ""):
+                    return value
+        return None
+    for name in names:
+        value = getattr(parsed, name, None)
+        if value not in (None, ""):
+            return value
+    admin_levels = getattr(parsed, "admin_levels", None)
+    if isinstance(admin_levels, dict):
+        for name in names:
+            value = admin_levels.get(name)
+            if value not in (None, ""):
+                return value
+    return None
 
-    Tên parser đoán ra nhưng khách không viết thì không được tính:
-    ví dụ parsed ward="Phú Cường" trong khi raw chỉ có "bi" -> không tính;
-    parsed district/tỉnh suy từ "Lam Sơn" trong khi raw chỉ có
-    "Sói 799, đường Lam Sơn" -> không tính.
+
+def _levels_from_parsed(parsed, admin_segments: list[tuple[str, ...]],
+                        known_provinces, known_districts, known_wards) -> set[str]:
+    """Cấp từ parsed, chỉ khi có bằng chứng trong ĐOẠN HÀNH CHÍNH của raw.
+
+    Tên parser đoán ra nhưng khách không viết thì không được tính, và
+    tên chỉ nằm trong đoạn đường thì cũng không được tính: ví dụ parsed
+    ward="Phú Cường" trong khi raw chỉ có "bi" -> không tính; parsed
+    district/tỉnh suy từ "Lam Sơn" trong khi raw chỉ có
+    "Sói 799, đường Lam Sơn" -> không tính (tên "Lam Sơn" chỉ nằm trong
+    đoạn đường, đã bị bỏ khỏi admin_segments).
     """
     if parsed is None:
         return set()
     levels: set[str] = set()
     fields = (
-        ("province", ("province_name", "province")),
-        ("district", ("district_name", "district")),
-        ("ward", ("ward_name", "ward")),
+        ("province", ("province_name", "province", "province_text")),
+        ("district", ("district_name", "district", "district_text")),
+        ("ward", ("ward_name", "ward", "ward_text")),
     )
     known_by_level = {
         "province": known_provinces,
@@ -196,17 +309,7 @@ def _levels_from_parsed(parsed, raw_tokens: tuple[str, ...],
         "ward": known_wards,
     }
     for level, names in fields:
-        value = None
-        if isinstance(parsed, dict):
-            for name in names:
-                if parsed.get(name) not in (None, ""):
-                    value = parsed.get(name)
-                    break
-        else:
-            for name in names:
-                value = getattr(parsed, name, None)
-                if value not in (None, ""):
-                    break
+        value = _get_parsed_field(parsed, names)
         if not value:
             continue
         name_tuple = _norm_tuple(str(value))
@@ -216,8 +319,9 @@ def _levels_from_parsed(parsed, raw_tokens: tuple[str, ...],
         known = known_by_level[level]
         if known and name_tuple not in known:
             continue
-        # (a) tên phải xuất hiện trong raw_input như dãy token liên tiếp.
-        if not _contains_subsequence(raw_tokens, name_tuple):
+        # (a) tên phải xuất hiện trong một đoạn hành chính của raw_input
+        # như dãy token liên tiếp.
+        if not any(_contains_subsequence(seg_tokens, name_tuple) for seg_tokens in admin_segments):
             continue
         levels.add(level)
     return levels
@@ -226,30 +330,48 @@ def _levels_from_parsed(parsed, raw_tokens: tuple[str, ...],
 class InputGuard:
     """Chặn input thiếu cấp / mơ hồ trước khi vào pipeline, fail-closed."""
 
-    def __init__(self, known_provinces=None, known_districts=None,
-                 known_wards=None, *args, **kwargs) -> None:
-        # Chấp nhận cả cách gọi theo dict known_names / admin_index.
-        if kwargs.get("known_names"):
-            known = kwargs["known_names"] or {}
-            known_provinces = known_provinces or known.get("province") or known.get("provinces")
-            known_districts = known_districts or known.get("district") or known.get("districts")
-            known_wards = known_wards or known.get("ward") or known.get("wards")
-        index = kwargs.get("admin_index") or kwargs.get("index")
+    def __init__(self, *args, **kwargs) -> None:
+        known_provinces = (kwargs.pop("known_provinces", None)
+                           or kwargs.pop("provinces", None)
+                           or kwargs.pop("province_names", None))
+        known_districts = (kwargs.pop("known_districts", None)
+                           or kwargs.pop("districts", None)
+                           or kwargs.pop("district_names", None))
+        known_wards = (kwargs.pop("known_wards", None)
+                       or kwargs.pop("wards", None)
+                       or kwargs.pop("ward_names", None))
+        known_names = kwargs.pop("known_names", None)
+        if isinstance(known_names, dict):
+            known_provinces = known_provinces or known_names.get("province") or known_names.get("provinces")
+            known_districts = known_districts or known_names.get("district") or known_names.get("districts")
+            known_wards = known_wards or known_names.get("ward") or known_names.get("wards")
+        positional = list(args)
+        if positional:
+            first = positional[0]
+            if hasattr(first, "units"):
+                provinces, districts, wards = _known_from_index(first)
+                known_provinces = known_provinces or provinces
+                known_districts = known_districts or districts
+                known_wards = known_wards or wards
+                positional = positional[1:]
+            elif isinstance(first, dict):
+                known_provinces = known_provinces or first.get("province") or first.get("provinces")
+                known_districts = known_districts or first.get("district") or first.get("districts")
+                known_wards = known_wards or first.get("ward") or first.get("wards")
+                positional = positional[1:]
+        if positional:
+            if len(positional) >= 1 and known_provinces is None:
+                known_provinces = positional[0]
+            if len(positional) >= 2 and known_districts is None:
+                known_districts = positional[1]
+            if len(positional) >= 3 and known_wards is None:
+                known_wards = positional[2]
+        index = kwargs.pop("admin_index", None) or kwargs.pop("index", None)
         if index is not None and not (known_provinces or known_districts or known_wards):
-            units = getattr(index, "units", {}) or {}
-            provinces, districts, wards = set(), set(), set()
-            for unit in units.values():
-                level = getattr(unit, "level", None)
-                tup = _entry_to_tuple(unit)
-                if not tup:
-                    continue
-                if level in ("province", "tinh"):
-                    provinces.add(tup)
-                elif level in ("district", "huyen", "quan"):
-                    districts.add(tup)
-                elif level in ("ward", "xa", "phuong"):
-                    wards.add(tup)
-            known_provinces, known_districts, known_wards = provinces, districts, wards
+            provinces, districts, wards = _known_from_index(index)
+            known_provinces = known_provinces or provinces
+            known_districts = known_districts or districts
+            known_wards = known_wards or wards
         self.known_provinces = _to_known_set(known_provinces)
         self.known_districts = _to_known_set(known_districts)
         self.known_wards = _to_known_set(known_wards)
@@ -257,10 +379,13 @@ class InputGuard:
     def check(self, raw=None, parsed=None, *args, **kwargs) -> GuardResult:
         # AddressService gọi check(raw_input, parsed); cũng chấp nhận
         # check(raw_input="...", parsed_address=...) hoặc check(parsed) đơn.
-        if raw is None and kwargs.get("raw_input") is not None:
-            raw = kwargs["raw_input"]
-        if parsed is None and kwargs.get("parsed_address") is not None:
-            parsed = kwargs["parsed_address"]
+        if raw is None:
+            raw = kwargs.get("raw_input") or kwargs.get("raw") or kwargs.get("text") or ""
+        if isinstance(raw, dict):
+            parsed = parsed or raw.get("parsed")
+            raw = raw.get("raw_input") or raw.get("raw") or raw.get("text") or ""
+        if parsed is None:
+            parsed = kwargs.get("parsed") or kwargs.get("parsed_address") or kwargs.get("address")
         if parsed is None and args:
             parsed = args[0]
         raw_str = raw if isinstance(raw, str) else (str(raw) if raw is not None else "")
@@ -277,12 +402,12 @@ class InputGuard:
         if len(norm) <= 3:
             return GuardResult(GuardDecision.NEED_CLARIFICATION, ReasonCode.INPUT_TOO_SHORT,
                                "Input quá ngắn.")
-        raw_tokens = tuple(norm.split())
+        admin_segments = _admin_segments(raw_str)
         levels = set()
         levels |= _detect_levels_by_name(raw_str, self.known_provinces,
                                          self.known_districts, self.known_wards)
         levels |= _detect_levels_by_prefix(raw_str)
-        levels |= _levels_from_parsed(parsed, raw_tokens, self.known_provinces,
+        levels |= _levels_from_parsed(parsed, admin_segments, self.known_provinces,
                                       self.known_districts, self.known_wards)
         if len(levels) < 2:
             if "province" not in levels:
