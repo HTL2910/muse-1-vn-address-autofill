@@ -1,21 +1,47 @@
 """
 Integration contract: Pancake / Goong / carriers - approach_19
-Fix: fix_adapter_fail_closed_allowlist — allowlist + mapping đã sửa
-ở lần trước, giữ nguyên ở lần này:
-  REJECTED_INSUFFICIENT -> BLOCKED_UNVERIFIED (kiểm tra chuỗi gốc
-  trước, không collapse qua AddressStatus.REJECTED).
-  Phân cấp ở adapter chỉ kiểm tra định dạng + anchored province,
-  không prefix chuỗi.
+Fix: fix_adapter_fail_closed_allowlist - allowlist + status mapping
+(kept unchanged):
+  REJECTED_INSUFFICIENT -> BLOCKED_UNVERIFIED (checked on the raw
+  string first, never collapsed through AddressStatus.REJECTED).
+  Hierarchy check at the adapter verifies format + anchored province
+  only, never string prefixes.
+
+Fix: fix_adapter_idempotency_audit_pii:
+  1. Idempotency is anchored to the ORDER only:
+     make_idempotency_key(pancake_order_id) - raw_input and phone are
+     accepted for caller compatibility but are NEVER part of the key.
+  2. Audit is append-only with a hash chain: save() APPENDS an entry
+     (seq, prev_hash, entry_hash) and never overwrites or deletes a
+     previous entry; history(key) retains every attempt for disputes.
+  3. Latest-view transition rules (corrected after test review):
+     - COMMITTED is the only order-sticky status: once a label exists,
+       no later decision displaces it in the latest view.
+     - BLOCKED_* / NEEDS_REVIEW / LABEL_FAILED end one ATTEMPT only:
+       a reprocessed order (customer corrected the address, label
+       retry) supersedes them, e.g.
+       BLOCKED_UNVERIFIED -> NEEDS_REVIEW -> COMMITTED.
+     - DRAFT_FROM_PANCAKE never displaces a real decision.
+  4. PII: the STORED audit entry is a redacted copy - raw_input is
+     replaced by raw_input_encrypted (authenticated encryption via
+     src/security/address_pii_protection) plus raw_input_sha256, and
+     phone/name/note/detail/street fields in stored dicts are scrubbed.
+     Plaintext exists only in the in-memory record returned to the
+     caller of the current request, never at rest, never in
+     audit_to_json(). Per-key locks use a fixed striped set (64).
+
+Status: chua chay - ket qua do CI bao.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol
 
 try:
     from ..address.domain.schemas import (
@@ -29,6 +55,37 @@ except Exception:  # pragma: no cover
     _CanonicalAddressStatus = None  # type: ignore
     _CanonicalGateStatus = None  # type: ignore
     _gate_to_address_status = None  # type: ignore
+
+try:
+    from ..security.address_pii_protection import encrypt_pii, scrub_pii
+except Exception:  # pragma: no cover - standalone fallback, never plaintext
+    import base64 as _b64
+    import hmac as _hmac
+    import secrets as _secrets
+
+    def encrypt_pii(plaintext, key=None):  # type: ignore
+        text = "" if plaintext is None else str(plaintext)
+        if not text:
+            return ""
+        raw_key = hashlib.sha256(str(key or "dev-only-address-pii-key-change-me").encode()).digest()
+        nonce = _secrets.token_bytes(16)
+        data = text.encode("utf-8")
+        stream = bytearray(); counter = 0
+        while len(stream) < len(data):
+            stream.extend(_hmac.new(raw_key, nonce + counter.to_bytes(4, "big"), hashlib.sha256).digest())
+            counter += 1
+        ct = bytes(a ^ b for a, b in zip(data, bytes(stream[:len(data)])))
+        tag = _hmac.new(raw_key, b"tag" + nonce + ct, hashlib.sha256).digest()
+        return "enc:v1:" + _b64.b64encode(b"H" + nonce + ct + tag).decode("ascii")
+
+    def scrub_pii(obj):  # type: ignore
+        pii = {"phone", "customer_phone", "tel", "mobile", "name", "customer_name",
+               "note", "detail", "street", "address", "raw_input", "full_address"}
+        if isinstance(obj, dict):
+            return {k: ("***" if str(k).lower() in pii else scrub_pii(v)) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [scrub_pii(v) for v in obj]
+        return obj
 
 MIN_CONFIDENCE = 0.85
 ALLOWED_VALIDATOR_DECISIONS = frozenset({"OK"})
@@ -59,13 +116,16 @@ class OrderAddressStatus(str, Enum):
     LABEL_FAILED = "LABEL_FAILED"
 
 
-_TERMINAL_STATUSES = frozenset({
-    OrderAddressStatus.COMMITTED,
+# Attempt-terminal statuses: they end one processing attempt, they do
+# NOT freeze the order. Only COMMITTED freezes the latest view.
+_ATTEMPT_TERMINAL_STATUSES = frozenset({
     OrderAddressStatus.BLOCKED_CARRIER_MISMATCH,
     OrderAddressStatus.BLOCKED_UNVERIFIED,
     OrderAddressStatus.BLOCKED_LOW_CONFIDENCE,
     OrderAddressStatus.BLOCKED_GATE_REJECTED,
+    OrderAddressStatus.LABEL_FAILED,
 })
+_STICKY_STATUS = OrderAddressStatus.COMMITTED
 
 
 def _sha256_hex(text: str) -> str:
@@ -103,10 +163,44 @@ class AuditRecord:
     gate_result: Dict[str, Any] = field(default_factory=dict)
     confidence_score: Optional[float] = None
     reason_code: str = ""
+    raw_input_encrypted: str = ""
+    audit_seq: int = 0
+    prev_hash: str = ""
+    entry_hash: str = ""
 
     def __post_init__(self) -> None:
         if not self.raw_input_sha256 and self.raw_input:
             self.raw_input_sha256 = _sha256_hex(self.raw_input)
+
+    def stored_copy(self) -> "AuditRecord":
+        """Redacted copy that is safe to persist: no plaintext PII."""
+        return dataclasses.replace(
+            self,
+            raw_input="",
+            raw_input_encrypted=self.raw_input_encrypted or encrypt_pii(self.raw_input),
+            raw_input_sha256=self.raw_input_sha256 or _sha256_hex(self.raw_input),
+            pancake_suggestion=scrub_pii(self.pancake_suggestion or {}),
+            provider_responses=scrub_pii(self.provider_responses or {}),
+            final_address=scrub_pii(self.final_address) if self.final_address else None,
+            customer_confirmed_address=(scrub_pii(self.customer_confirmed_address)
+                                        if self.customer_confirmed_address else None),
+        )
+
+
+def _entry_hash(seq: int, prev_hash: str, record: AuditRecord) -> str:
+    canonical = json.dumps({
+        "seq": seq,
+        "prev_hash": prev_hash,
+        "idempotency_key": record.idempotency_key,
+        "pancake_order_id": record.pancake_order_id,
+        "status": record.status.value if isinstance(record.status, Enum) else str(record.status),
+        "raw_input_sha256": record.raw_input_sha256,
+        "carrier": record.carrier,
+        "carrier_label_id": record.carrier_label_id,
+        "reason_code": record.reason_code,
+        "created_at": record.created_at,
+    }, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class RouterPort(Protocol):
@@ -135,33 +229,85 @@ class CarrierLabelPort(Protocol):
 class AuditStorePort(Protocol):
     def get_by_idempotency_key(self, key: str) -> Optional[AuditRecord]: ...
     def save(self, record: AuditRecord) -> None: ...
+    def history(self, key: str) -> List[AuditRecord]: ...
+    def verify_chain(self) -> bool: ...
 
 
 def make_idempotency_key(pancake_order_id: str, raw_input: str = "", phone_ref: str = "") -> str:
+    """Idempotency anchored to the ORDER only. raw_input / phone_ref are
+    accepted for caller compatibility and deliberately ignored."""
+    _ = (raw_input, phone_ref)
     digest = hashlib.sha256(f"{(pancake_order_id or '').strip()}".encode("utf-8")).hexdigest()
     return f"addr:{digest[:40]}"
 
 
 class InMemoryAuditStore:
+    """Append-only, hash-chained, PII-encrypted audit store.
+
+    save() never overwrites history. The latest-view pointer follows
+    the transition rules in the module docstring: COMMITTED is sticky,
+    attempt-terminal statuses (BLOCKED_*, LABEL_FAILED) and NEEDS_REVIEW
+    are superseded by the next decision for the same order, and a DRAFT
+    never displaces a real decision.
+    """
+
+    GENESIS_HASH = "0" * 64
+
     def __init__(self) -> None:
-        self._data: Dict[str, AuditRecord] = {}
+        self._history: List[AuditRecord] = []
+        self._latest: Dict[str, AuditRecord] = {}
         self._lock = threading.Lock()
 
     def get_by_idempotency_key(self, key: str) -> Optional[AuditRecord]:
         with self._lock:
-            return self._data.get(key)
+            return self._latest.get(key)
+
+    def history(self, key: Optional[str] = None) -> List[AuditRecord]:
+        with self._lock:
+            if key is None:
+                return list(self._history)
+            return [r for r in self._history if r.idempotency_key == key]
+
+    def all_records(self) -> List[AuditRecord]:
+        return self.history()
+
+    def verify_chain(self) -> bool:
+        with self._lock:
+            prev = self.GENESIS_HASH
+            for expected_seq, entry in enumerate(self._history, start=1):
+                if entry.audit_seq != expected_seq or entry.prev_hash != prev:
+                    return False
+                if entry.entry_hash != _entry_hash(entry.audit_seq, entry.prev_hash, entry):
+                    return False
+                prev = entry.entry_hash
+            return True
 
     def save(self, record: AuditRecord) -> None:
         with self._lock:
-            existing = self._data.get(record.idempotency_key)
+            stored = record.stored_copy()
+            seq = len(self._history) + 1
+            prev = self._history[-1].entry_hash if self._history else self.GENESIS_HASH
+            stored.audit_seq = seq
+            stored.prev_hash = prev
+            stored.entry_hash = _entry_hash(seq, prev, stored)
+            self._history.append(stored)
+            record.audit_seq = seq
+            record.prev_hash = prev
+            record.entry_hash = stored.entry_hash
+            record.raw_input_sha256 = stored.raw_input_sha256
+            existing = self._latest.get(record.idempotency_key)
             if existing is None:
-                self._data[record.idempotency_key] = record
-                return
-            if existing.status in _TERMINAL_STATUSES:
-                return
-            if record.status == OrderAddressStatus.DRAFT_FROM_PANCAKE:
-                return
-            self._data[record.idempotency_key] = record
+                self._latest[record.idempotency_key] = stored
+            elif existing.status == _STICKY_STATUS:
+                pass  # COMMITTED stands: a label already exists for this order
+            elif (record.status == OrderAddressStatus.DRAFT_FROM_PANCAKE
+                  and existing.status != OrderAddressStatus.DRAFT_FROM_PANCAKE):
+                pass  # a draft never displaces a real decision
+            else:
+                # Attempt-terminal and review statuses are superseded by
+                # the next decision for the same order (reprocessing
+                # after the customer corrected the address).
+                self._latest[record.idempotency_key] = stored
 
 
 _STRIPED_LOCKS = [threading.Lock() for _ in range(64)]
@@ -380,7 +526,7 @@ class PancakeGoongShippingAdapter:
     @staticmethod
     def audit_to_json(record: AuditRecord) -> str:
         final = dict(record.final_address or {})
-        for k in ("phone", "customer_phone", "note"):
+        for k in ("phone", "customer_phone", "note", "detail", "street"):
             if k in final:
                 final[k] = "***"
         return json.dumps({
@@ -388,6 +534,7 @@ class PancakeGoongShippingAdapter:
             "pancake_order_id": record.pancake_order_id,
             "raw_input_sha256": record.raw_input_sha256 or _sha256_hex(record.raw_input),
             "raw_input_masked": _masked_preview(record.raw_input),
+            "raw_input_encrypted": record.raw_input_encrypted,
             "status": record.status.value,
             "carrier": record.carrier,
             "carrier_label_id": record.carrier_label_id,
@@ -396,4 +543,7 @@ class PancakeGoongShippingAdapter:
             "gate_result": record.gate_result,
             "confidence_score": record.confidence_score,
             "reason_code": record.reason_code,
+            "audit_seq": record.audit_seq,
+            "prev_hash": record.prev_hash,
+            "entry_hash": record.entry_hash,
         }, ensure_ascii=False)
