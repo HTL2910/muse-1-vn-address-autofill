@@ -1,21 +1,19 @@
 """
-Golden regression tests — fix_missing_golden_tests (bản sửa sau CI fail #1).
+Golden regression tests — fix_missing_golden_tests (bản sửa sau CI fail #2).
 
 Chưa chạy trong phiên này (KHÔNG_CHẠY_LỆNH); CI chạy:
     python -m pytest tests/golden -v
 
-Hai lỗi của bản trước, đã sửa:
-1) AddressGateway.autofill() có tham số vị trí bắt buộc ngoài raw_input —
-   gọi mò theo vị trí/kwargs đoán trước đều TypeError. Bản này introspect
-   chữ ký bằng inspect.signature và điền tham số THEO TÊN, tự cấp giá trị
-   tổng hợp cho tham số bắt buộc khác (order_id, shop_id, phone, request...),
-   đồng thời unwrap coroutine và enum trong kết quả.
-2) observability.run_golden_regression(run_one, cases) dùng contract riêng:
-   run_one(raw_str) -> (decision, output, province) và cases là GoldenCase
-   object. Bản này KHÔNG truyền dict JSON vào đó nữa; khi dùng observability
-   sẽ truyền adapter chuỗi->tuple và bộ ca mặc định của chính observability,
-   đọc report theo dict hoặc object; contract không khớp thì tự tính metric
-   tương đương với cùng ngưỡng assert (forbidden-default = 0, sai tỉnh = 0).
+Lỗi lần trước (trong harness, không phải pipeline):
+    AddressGateway.resolve_address -> self._service.resolve(...)
+    AttributeError: 'ConfidenceGate' object has no attribute 'resolve'
+Nguyên nhân: fallback dựng instance cũ truyền nhầm ConfidenceGate vào vị
+trí service của gateway. Bản này:
+- Chỉ truyền cho gateway đối tượng ĐÃ KIỂM CHỨNG có method resolve.
+- Dựng AddressService bằng DI introspection đệ quy (theo tên/annotation
+  của tham số __init__), có chống vòng lặp và giới hạn độ sâu.
+- Không dựng được gateway thì gọi trực tiếp AddressService.resolve —
+  đúng method mà gateway ủy thác — làm pipeline, không mock, không skip.
 """
 from __future__ import annotations
 
@@ -67,9 +65,6 @@ REQUIRED_ORIGINAL_IDS = {
     "golden_09_bi_accented_ambiguous",
 }
 
-# Reason hợp lệ theo nhóm trạng thái (chuẩn chung của runner, hợp nhất với
-# danh sách riêng từng ca trong JSON). Reason của nhóm ngược lại, hoặc rỗng,
-# đều bị coi là sai.
 REJECT_REASONS = {
     "UNREADABLE_INPUT", "UNPARSEABLE", "INSUFFICIENT_INFO", "INSUFFICIENT",
     "REJECTED_INSUFFICIENT", "FORBIDDEN_DEFAULT", "TOO_SHORT", "INPUT_TOO_SHORT",
@@ -131,13 +126,182 @@ def test_dataset_has_valid_control_case():
 
 
 # --------------------------------------------------------------------------- #
-# 2) Gọi pipeline bằng introspection chữ ký (sửa lỗi TypeError lần trước)
+# 2) DI introspection: dựng đúng dependency, kiểm chứng method trước khi truyền
+# --------------------------------------------------------------------------- #
+
+_SCAN_MODULES = (
+    "src.address.services.address_service",
+    "src.address.api.address_gateway",
+    "src.address.domain.confidence_gate",
+    "src.address.domain.input_guard",
+    "src.address.domain.province_anchor",
+    "src.address.domain.fuzzy_matcher",
+    "src.address.domain.validator",
+    "src.address.domain.ranker",
+    "src.address.domain.vn_normalizer",
+    "src.address.domain.structured_parser",
+    "src.address.infrastructure.geocoding_router",
+    "src.address.infrastructure.admin_boundary_store",
+    "src.address.infrastructure.feedback_store",
+)
+
+_KEYWORD_CLASSES = (
+    ("service", ("AddressService",)),
+    ("gate", ("ConfidenceGate",)),
+    ("confidence", ("ConfidenceGate",)),
+    ("guard", ("InputGuard",)),
+    ("anchor", ("ProvinceAnchor",)),
+    ("province", ("ProvinceAnchor",)),
+    ("matcher", ("FuzzyMatcher",)),
+    ("fuzzy", ("FuzzyMatcher",)),
+    ("validator", ("HierarchicalValidator", "AddressValidator", "Validator")),
+    ("validation", ("HierarchicalValidator", "AddressValidator", "Validator")),
+    ("router", ("GeocodingRouter",)),
+    ("geocod", ("GeocodingRouter",)),
+    ("ranker", ("EnsembleRanker", "Ranker")),
+    ("ranking", ("EnsembleRanker", "Ranker")),
+    ("normalizer", ("VnNormalizer", "VietnameseNormalizer", "AddressNormalizer")),
+    ("normalize", ("VnNormalizer", "VietnameseNormalizer", "AddressNormalizer")),
+    ("parser", ("StructuredAddressParser", "AddressParser")),
+    ("store", ("AdminBoundaryStore", "AdminStore")),
+    ("admin", ("AdminBoundaryStore", "AdminStore")),
+    ("repository", ("AdminBoundaryStore", "AdminStore")),
+    ("feedback", ("FeedbackStore",)),
+)
+
+_PRIMITIVES = (str, int, float, bool, dict, list, tuple, set, bytes, type(None))
+
+
+def _class_registry() -> dict:
+    registry = {}
+    for module_name in _SCAN_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        for name, obj in vars(module).items():
+            if inspect.isclass(obj) and obj.__module__ == module_name:
+                registry.setdefault(name, obj)
+    return registry
+
+
+_REGISTRY = None
+
+
+def _registry() -> dict:
+    global _REGISTRY
+    if _REGISTRY is None:
+        _REGISTRY = _class_registry()
+    return _REGISTRY
+
+
+def _resolve_dependency(name: str, annotation, depth: int, seen: frozenset):
+    """Tìm instance cho một tham số __init__ theo annotation rồi theo tên."""
+    if isinstance(annotation, type) and annotation not in _PRIMITIVES:
+        return _build_instance(annotation, depth + 1, seen)
+    lowered = name.lower()
+    for keyword, class_names in _KEYWORD_CLASSES:
+        if keyword in lowered:
+            for class_name in class_names:
+                cls = _registry().get(class_name)
+                if cls is not None:
+                    return _build_instance(cls, depth + 1, seen)
+    if "path" in lowered or "db" in lowered or "dsn" in lowered:
+        return ":memory:"
+    if annotation in (dict, "dict"):
+        return {}
+    if annotation in (list, tuple, set, "list", "tuple", "set"):
+        return []
+    if annotation in (int, "int"):
+        return 0
+    if annotation in (bool, "bool"):
+        return False
+    if annotation in (float, "float"):
+        return 0.0
+    return ""
+
+
+def _build_instance(cls, depth: int = 0, seen: frozenset = frozenset()):
+    if depth > 3 or cls in seen:
+        raise RuntimeError(f"DI quá sâu hoặc vòng lặp tại {cls!r}")
+    try:
+        return cls()
+    except Exception:
+        pass
+    seen = seen | {cls}
+    try:
+        signature = inspect.signature(cls.__init__)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Không introspect được {cls.__name__}") from exc
+    kwargs, positional = {}, []
+    for name, param in signature.parameters.items():
+        if name in ("self", "cls") or param.kind in (
+                inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        if param.default is not inspect.Parameter.empty:
+            continue
+        annotation = param.annotation
+        if isinstance(annotation, str):
+            annotation = _registry().get(annotation, annotation)
+        value = _resolve_dependency(name, annotation, depth, seen)
+        if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+            positional.append(value)
+        else:
+            kwargs[name] = value
+    try:
+        return cls(*positional, **kwargs)
+    except Exception:
+        return cls(*positional, *kwargs.values())
+
+
+def _build_service():
+    """Dựng AddressService thật; chỉ trả về object có method resolve."""
+    service_cls = _registry().get("AddressService")
+    if service_cls is None:
+        module = importlib.import_module("src.address.services.address_service")
+        service_cls = getattr(module, "AddressService")
+    service = _build_instance(service_cls)
+    assert callable(getattr(service, "resolve", None)), (
+        "AddressService đã dựng không có method resolve — sai contract với gateway")
+    return service
+
+
+def _load_pipeline_callable():
+    """
+    Ưu tiên: AddressGateway(service) -> gateway.autofill/resolve_address.
+    Dự phòng: AddressService.resolve (đúng method gateway ủy thác).
+    Không bao giờ truyền object chưa kiểm chứng method vào gateway.
+    """
+    errors = []
+    service = None
+    try:
+        service = _build_service()
+    except Exception as exc:
+        errors.append(f"AddressService: {type(exc).__name__}: {exc}")
+    gateway_cls = _registry().get("AddressGateway")
+    if gateway_cls is not None and service is not None:
+        for build in (lambda: gateway_cls(service), lambda: gateway_cls()):
+            try:
+                gateway = build()
+            except Exception as exc:
+                errors.append(f"AddressGateway: {type(exc).__name__}: {exc}")
+                continue
+            for method_name in ("autofill", "resolve_address", "process", "handle"):
+                fn = getattr(gateway, method_name, None)
+                if callable(fn):
+                    return fn
+    if service is not None:
+        return service.resolve
+    raise AssertionError("Không dựng được pipeline thật. Chi tiết: " + "; ".join(errors))
+
+
+# --------------------------------------------------------------------------- #
+# 3) Gọi pipeline theo chữ ký, chuẩn hóa kết quả
 # --------------------------------------------------------------------------- #
 
 def _enum_value(value):
     raw = getattr(value, "value", value)
-    text = str(raw).upper()
-    return text.rsplit(".", 1)[-1]  # "Decision.VERIFIED" -> "VERIFIED"
+    return str(raw).upper().rsplit(".", 1)[-1]
 
 
 def _maybe_await(value):
@@ -150,7 +314,6 @@ def _maybe_await(value):
 
 
 def _build_kwargs(fn, raw_input, declared, suggestion, case_id):
-    """Điền tham số theo TÊN từ chữ ký thật của fn. Trả (args, kwargs)."""
     try:
         signature = inspect.signature(fn)
     except (TypeError, ValueError):
@@ -160,7 +323,7 @@ def _build_kwargs(fn, raw_input, declared, suggestion, case_id):
         "declared_province_code": declared, "province_code": declared,
         "provider_suggestion": suggestion, "suggestion": suggestion,
         "order_id": f"golden-{case_id}", "shop_id": "golden-shop",
-        "phone": "0000000000", "phone_ref": "golden",
+        "phone": "0000000000", "phone_ref": "golden", "carrier": "SPX",
     }
     by_name = {
         "raw_input": raw_input, "raw": raw_input, "raw_address": raw_input,
@@ -175,7 +338,7 @@ def _build_kwargs(fn, raw_input, declared, suggestion, case_id):
         "shop_id": "golden-shop", "phone": "0000000000",
         "phone_ref": "golden", "request": request_payload,
         "payload": request_payload, "data": request_payload,
-        "context": request_payload, "case_id": case_id,
+        "context": request_payload, "case_id": case_id, "carrier": "SPX",
     }
     args, kwargs = [], {}
     for name, param in signature.parameters.items():
@@ -190,7 +353,7 @@ def _build_kwargs(fn, raw_input, declared, suggestion, case_id):
         if name in by_name:
             value = by_name[name]
         elif param.default is not inspect.Parameter.empty:
-            continue  # để mặc định của pipeline
+            continue
         elif param.annotation in (dict, "dict"):
             value = request_payload
         elif param.annotation in (int, "int"):
@@ -211,58 +374,7 @@ def _call_pipeline(fn, raw_input, declared, suggestion, case_id):
     try:
         return _maybe_await(fn(*args, **kwargs))
     except TypeError:
-        # Phương án cuối: chỉ raw_input (hàm 1 tham số thuần).
         return _maybe_await(fn(raw_input))
-
-
-def _construct(cls):
-    """Tạo instance: thử không đối số, rồi thử truyền service/gateway phổ biến."""
-    try:
-        return cls()
-    except Exception:
-        pass
-    for module_name, class_name in (
-            ("src.address.services.address_service", "AddressService"),
-            ("src.address.domain.confidence_gate", "ConfidenceGate")):
-        try:
-            dep_cls = getattr(importlib.import_module(module_name), class_name)
-            return cls(dep_cls())
-        except Exception:
-            continue
-    return cls  # để getattr lấy unbound, lỗi sẽ hiện rõ ở bước gọi
-
-
-def _load_pipeline_callable():
-    attempts = []
-    candidates = (
-        ("src.address.api.address_gateway", ("AddressGateway", "Gateway"),
-         ("autofill", "process", "handle", "resolve")),
-        ("src.address.services.address_service", ("AddressService",),
-         ("process", "handle", "resolve_address", "process_address", "autofill")),
-    )
-    for module_name, class_names, method_names in candidates:
-        try:
-            module = importlib.import_module(module_name)
-        except Exception as exc:
-            attempts.append(f"{module_name}: {type(exc).__name__}: {exc}")
-            continue
-        for class_name in class_names:
-            cls = getattr(module, class_name, None)
-            if cls is None:
-                continue
-            instance = _construct(cls)
-            for method_name in method_names:
-                fn = getattr(instance, method_name, None)
-                if callable(fn):
-                    return fn
-        for func_name in method_names:
-            fn = getattr(module, func_name, None)
-            if callable(fn):
-                return fn
-        attempts.append(f"{module_name}: không thấy entry point phù hợp")
-    raise AssertionError(
-        "Không tìm thấy pipeline entry point trên main (AddressGateway/"
-        "AddressService). Chi tiết: " + "; ".join(attempts))
 
 
 _PIPELINE = None
@@ -272,8 +384,8 @@ def _normalize_result(raw) -> dict:
     if raw is None:
         return {}
     if isinstance(raw, (tuple, list)) and len(raw) >= 2:
-        # Dạng (decision, output, province?) giống contract observability.
-        return {"status": STATUS_ALIASES.get(_enum_value(raw[0]), _enum_value(raw[0])),
+        status = _enum_value(raw[0])
+        return {"status": STATUS_ALIASES.get(status, status),
                 "province_name": raw[2] if len(raw) > 2 else None,
                 "reason_code": ""}
     if not isinstance(raw, dict):
@@ -294,10 +406,9 @@ def _normalize_result(raw) -> dict:
                     "province_name", "district_name", "ward_name"):
             if raw.get(key) is None:
                 raw[key] = nested.get(key)
-    status = STATUS_ALIASES.get(_enum_value(raw.get("status") or raw.get("decision") or ""),
-                                _enum_value(raw.get("status") or raw.get("decision") or ""))
+    status_raw = _enum_value(raw.get("status") or raw.get("decision") or "")
     result = {
-        "status": status,
+        "status": STATUS_ALIASES.get(status_raw, status_raw),
         "province_code": raw.get("province_code"),
         "district_code": raw.get("district_code"),
         "ward_code": raw.get("ward_code"),
@@ -306,10 +417,9 @@ def _normalize_result(raw) -> dict:
         "ward_name": raw.get("ward_name"),
         "reason_code": _enum_value(raw.get("reason_code") or raw.get("reason") or ""),
     }
-    if status == "REJECTED":
-        # REJECTED nghĩa là không có địa chỉ được chốt: chỉ tôn trọng mã
-        # committed tường minh (nếu pipeline có trả), còn mã ứng viên đề
-        # xuất kèm theo không được tính là mã đã chốt.
+    if result["status"] == "REJECTED":
+        # REJECTED = không chốt địa chỉ: chỉ tôn trọng mã committed tường
+        # minh, mã ứng viên đề xuất kèm theo không tính là mã đã chốt.
         for key in ("province_code", "district_code", "ward_code"):
             result[key] = raw.get(f"committed_{key}")
     return result
@@ -327,7 +437,7 @@ def run_one(case: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# 3) Assert từng ca
+# 4) Assert từng ca
 # --------------------------------------------------------------------------- #
 
 def _acceptable_reasons(case: dict, result: dict) -> set:
@@ -385,7 +495,7 @@ def test_golden_case(case):
 
 
 # --------------------------------------------------------------------------- #
-# 4) Metric toàn cục + observability (contract thật của observability)
+# 5) Metric toàn cục + observability (contract thật của observability)
 # --------------------------------------------------------------------------- #
 
 def _local_global_assertions() -> None:
@@ -430,7 +540,7 @@ def test_golden_regression_via_observability_if_available():
         run_regression = None
     if run_regression is not None:
         try:
-            # Không truyền cases của file này (dict) — observability dùng
+            # Không truyền cases dict của file này — observability dùng
             # GoldenCase object của chính nó làm mặc định.
             report = run_regression(_run_one_for_observability)
         except Exception:
@@ -458,6 +568,4 @@ def test_golden_regression_via_observability_if_available():
             if forbidden_rate is not None:
                 assert forbidden_rate == 0
                 return
-    # observability không có / contract không khớp: tự tính metric tương
-    # đương với cùng ngưỡng (forbidden-default = 0, sai tỉnh đã khai = 0).
     _local_global_assertions()
