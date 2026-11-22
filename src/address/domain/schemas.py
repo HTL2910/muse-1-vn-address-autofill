@@ -1,49 +1,32 @@
-"""
-Address Contract duy nhất — approach_01, nhánh expert/systems-arch-m1.
+"""Address Contract duy nhất — approach_01, canonical cho fix_missing_pipeline_core.
 
-Vị trí trong pipeline:
-    Normalize -> Parse -> Anchor tỉnh -> Match trong phạm vi đã khóa
-    -> Multi-provider Geocode -> Rank -> Validate phân cấp
-    -> Confidence Gate -> Commit / NEEDS_REVIEW / REJECTED
-
-Mọi module Goong, Pancake, SPX, GHN đều đi qua pipeline này.
-File này chỉ chứa logic thuần, không phụ thuộc provider, DB hay HTTP.
-Không có địa chỉ mặc định. Không đoán khi thiếu dữ liệu.
+Mọi module parser, anchor, matcher, ranker, validator, gate đều giao
+tiếp qua contract này. Không raise cho lỗi nghiệp vụ: địa chỉ cấm,
+thiếu cấp, sai phân cấp đều trả về bằng status + reason_code, không
+làm sập pipeline. Chỉ validate định dạng mã và lat/lng bằng exception.
 """
 from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Optional
 
-
-# ---------------------------------------------------------------------------
-# Hằng số cấm — triệt tiêu lỗi "không đọc được thì điền mặc định"
-# ---------------------------------------------------------------------------
-# So sánh ở dạng đã chuẩn hóa (không dấu, thường, bỏ khoảng trắng thừa).
 FORBIDDEN_DEFAULT_ADDRESSES = frozenset(
-    {
-        "xa dak ya mang yang gia lai",
-        "dak ya mang yang gia lai",
-        "xa dak ya",
-    }
+    {"xa dak ya mang yang gia lai", "dak ya mang yang gia lai", "xa dak ya"}
 )
-
-# Mã hành chính Việt Nam sau sáp nhập 2025: tỉnh 2 số, huyện 3 số, xã 5 số.
 PROVINCE_CODE_RE = re.compile(r"^\d{2}$")
 DISTRICT_CODE_RE = re.compile(r"^\d{3}$")
 WARD_CODE_RE = re.compile(r"^\d{5}$")
 
 
 def normalize_text(value: str) -> str:
-    """Chuẩn hóa để so sánh: thường, bỏ dấu, đ->d, bỏ ký tự thừa."""
     if not value:
         return ""
     text = unicodedata.normalize("NFD", value.strip().lower())
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
-    text = text.replace("đ", "d").replace("Đ", "d")
+    text = text.replace("đ", "d")
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -53,8 +36,6 @@ def is_forbidden_default(value: str) -> bool:
 
 
 class AddressStatus(str, Enum):
-    """Trạng thái duy nhất của một địa chỉ trong pipeline."""
-
     PENDING = "PENDING"
     VERIFIED = "VERIFIED"
     NEEDS_REVIEW = "NEEDS_REVIEW"
@@ -62,11 +43,17 @@ class AddressStatus(str, Enum):
 
 
 class GateStatus(str, Enum):
-    """Kết quả trả về cho app / Pancake ở tầng Confidence Gate."""
-
     VERIFIED = "VERIFIED"
     NEED_CONFIRMATION = "NEED_CONFIRMATION"
     REJECTED_INSUFFICIENT = "REJECTED_INSUFFICIENT"
+
+
+def gate_to_address_status(gate: GateStatus) -> AddressStatus:
+    return {
+        GateStatus.VERIFIED: AddressStatus.VERIFIED,
+        GateStatus.NEED_CONFIRMATION: AddressStatus.NEEDS_REVIEW,
+        GateStatus.REJECTED_INSUFFICIENT: AddressStatus.REJECTED,
+    }[gate]
 
 
 class ReasonCode(str, Enum):
@@ -114,11 +101,6 @@ class PipelineStage(str, Enum):
 
 @dataclass(frozen=True)
 class AddressContract:
-    """
-    Address Contract duy nhất. Một địa chỉ chỉ được coi là dùng được
-    cho vận chuyển khi đủ 3 mã hành chính và status == VERIFIED.
-    """
-
     raw_input: str
     province: Optional[str] = None
     district: Optional[str] = None
@@ -139,8 +121,8 @@ class AddressContract:
     unmatched_tokens: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if is_forbidden_default(self.raw_input or ""):
-            raise ValueError("Forbidden default address in raw_input")
+        # Chỉ lỗi định dạng mới raise. Lỗi nghiệp vụ (default cấm,
+        # thiếu cấp) được biểu diễn bằng status/reason_code.
         if self.province_code and not PROVINCE_CODE_RE.match(self.province_code):
             raise ValueError(f"Invalid province_code: {self.province_code}")
         if self.district_code and not DISTRICT_CODE_RE.match(self.district_code):
@@ -154,17 +136,14 @@ class AddressContract:
         if self.lng is not None and not -180.0 <= self.lng <= 180.0:
             raise ValueError("lng out of range")
 
-    # -- Kiểm tra phân cấp -------------------------------------------------
+    @property
+    def is_forbidden_default(self) -> bool:
+        return is_forbidden_default(self.raw_input or "")
+
     @property
     def has_valid_codes(self) -> bool:
         return bool(
-            self.province_code
-            and self.district_code
-            and self.ward_code
-            and PROVINCE_CODE_RE.match(self.province_code)
-            and DISTRICT_CODE_RE.match(self.district_code)
-            and WARD_CODE_RE.match(self.ward_code)
-            # Mã huyện/xã phải bắt đầu bằng mã cha (ràng buộc phân cấp).
+            self.province_code and self.district_code and self.ward_code
             and self.district_code.startswith(self.province_code)
             and self.ward_code.startswith(self.district_code)
         )
@@ -179,73 +158,43 @@ class AddressContract:
 
     @property
     def completeness(self) -> float:
-        """Độ phủ thành phần 0-1, dùng làm feature cho Confidence Gate."""
-        parts = [
-            bool(self.province),
-            bool(self.district),
-            bool(self.ward),
-            bool(self.street),
-            bool(self.house_number),
-        ]
+        parts = [bool(self.province), bool(self.district), bool(self.ward),
+                 bool(self.street), bool(self.house_number)]
         return sum(parts) / len(parts)
 
     @property
     def is_shippable(self) -> bool:
-        """Chỉ VERIFIED + đủ mã + đủ phân cấp mới được đẩy sang SPX/GHN."""
         return self.status == AddressStatus.VERIFIED and self.is_hierarchy_complete
 
     def to_display(self) -> str:
-        parts = [
-            p
-            for p in [
-                self.house_number,
-                self.street,
-                self.hamlet,
-                self.ward,
-                self.district,
-                self.province,
-            ]
-            if p
-        ]
-        return ", ".join(parts)
+        return ", ".join(p for p in [self.house_number, self.street, self.hamlet,
+                                     self.ward, self.district, self.province] if p)
 
     def to_dict(self, redact_detail: bool = False) -> dict[str, Any]:
         return {
             "raw_input": "***" if redact_detail else self.raw_input,
-            "province": self.province,
-            "district": self.district,
-            "ward": self.ward,
+            "province": self.province, "district": self.district, "ward": self.ward,
             "street": self.street,
             "house_number": "***" if redact_detail else self.house_number,
-            "hamlet": self.hamlet,
-            "province_code": self.province_code,
-            "district_code": self.district_code,
-            "ward_code": self.ward_code,
-            "lat": self.lat,
-            "lng": self.lng,
-            "confidence": round(self.confidence, 4),
-            "source": self.source.value,
-            "status": self.status.value,
+            "hamlet": self.hamlet, "province_code": self.province_code,
+            "district_code": self.district_code, "ward_code": self.ward_code,
+            "lat": self.lat, "lng": self.lng, "confidence": round(self.confidence, 4),
+            "source": self.source.value, "status": self.status.value,
             "reason_code": self.reason_code.value,
-            "matched_tokens": self.matched_tokens,
-            "unmatched_tokens": self.unmatched_tokens,
+            "matched_tokens": self.matched_tokens, "unmatched_tokens": self.unmatched_tokens,
         }
 
 
 @dataclass
 class AddressCandidate:
-    """Một ứng viên từ provider, luôn mang theo mã hành chính để đối chiếu."""
-
     address: AddressContract
     provider: ProviderSource
-    provider_score: float = 0.0  # điểm gốc của provider, 0-1
-    rank_score: float = 0.0  # điểm sau khi cộng/trừ theo ràng buộc phân cấp
+    provider_score: float = 0.0
+    rank_score: float = 0.0
 
 
 @dataclass
 class PipelineResult:
-    """Kết quả đi qua từng tầng; tầng nào cũng có quyền từ chối."""
-
     contract: AddressContract
     stage_reached: PipelineStage
     stage_errors: dict[str, str] = field(default_factory=dict)
@@ -258,8 +207,7 @@ class PipelineResult:
     def reject(self, stage: PipelineStage, reason: ReasonCode) -> "PipelineResult":
         self.stage_reached = stage
         self.stage_errors[stage.value] = reason.value
-        self.contract = AddressContract(
-            **{**self.contract.__dict__, "status": AddressStatus.REJECTED,
-               "reason_code": reason, "confidence": 0.0}
-        )
+        # replace() không raise cho default cấm — lỗi nghiệp vụ trả về status.
+        self.contract = replace(self.contract, status=AddressStatus.REJECTED,
+                                reason_code=reason, confidence=0.0)
         return self

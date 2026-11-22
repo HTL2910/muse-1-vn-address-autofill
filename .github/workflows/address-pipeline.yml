@@ -1,0 +1,24 @@
+name: address-pipeline
+on:
+  pull_request:
+    paths:
+      - "src/address/**"
+      - "src/integrations/**"
+      - "tests/**"
+      - "scripts/manifest_check.py"
+  push:
+    branches: [main]
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Manifest check (git ls-files vs published list)
+        run: python scripts/manifest_check.py
+      - name: Compile pipeline
+        run: python -m py_compile src/address/domain/*.py src/address/services/address_service.py src/address/api/address_gateway.py
+      - name: Import smoke + golden regression
+        run: python -m pytest tests/test_pipeline_smoke.py -v

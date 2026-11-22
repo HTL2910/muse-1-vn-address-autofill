@@ -1,200 +1,136 @@
-"""
-approach_12 — Address Intelligence Service bất đồng bộ, idempotency và outbox.
+"""AddressService — entry point duy nhất, approach_12 + fix_missing_pipeline_core.
 
-Kiến trúc:
-- Service độc lập, tách khỏi app và Pancake. Đơn hàng chỉ lưu raw_address.
-- Trạng thái duy nhất: PENDING -> VERIFIED | NEEDS_REVIEW | REJECTED.
-  Không có trạng thái "điền mặc định rồi cho đi".
-- Idempotency-Key = sha256(order_id | phone | normalized_raw_address),
-  unique constraint ở store -> webhook retry không tạo trùng vận đơn.
-- Outbox Pattern: ghi kết quả + sự kiện outbox trong cùng một "giao dịch"
-  (ở bản triển khai in-memory là cùng một lần khóa; khi nối DB thật, thay
-  InMemoryStore bằng transaction SQL gồm bảng address_jobs + outbox_events).
-- Queue có giới hạn concurrency, retry exponential backoff + jitter tối đa
-  3 lần rồi vào Dead Letter Queue (DLQ). Worker auto-scale theo độ dài queue
-  được mô hình bằng `desired_workers()` để hạ tầng (K8s HPA / consumer group)
-  đọc làm tín hiệu; module này không tự hứa đã triển khai autoscaler.
-
-Chưa chạy: cần nối store/queue thật (Postgres + Kafka/RabbitMQ) ở infrastructure
-trước khi dùng production. Giao diện dưới đây cố ý giữ transport-agnostic để
-REST/gRPC handler ở src/address/api/ bọc lên trên.
+Thứ tự bắt buộc, không được gọi tắt:
+  Normalize -> InputGuard -> Parse -> Anchor -> Match -> Geocode
+  -> Rank -> Validate -> Gate -> Commit / NEEDS_REVIEW / REJECTED
+Adapter và API không được gọi thẳng provider (Goong/Pancake/SPX).
+Router là gợi ý, Canonical Admin DB là nguồn sự thật.
 """
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import random
-import time
-import unicodedata
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Awaitable, Callable, Protocol
+from dataclasses import dataclass, field, replace
+from typing import Any, Optional, Protocol
+
+from ..domain.confidence_gate import ConfidenceGate
+from ..domain.fuzzy_matcher import FuzzyMatcher
+from ..domain.input_guard import InputGuard
+from ..domain.province_anchor import AdminIndex, anchor_province
+from ..domain.ranker import Ranker
+from ..domain.schemas import (AddressCandidate, AddressContract, AddressStatus,
+                              GateStatus, PipelineResult, PipelineStage,
+                              ProviderSource, ReasonCode, gate_to_address_status,
+                              normalize_text)
+from ..domain.structured_parser import parse_address
+from ..domain.validator import Decision, HierarchicalValidator
 
 
-class AddressStatus(str, Enum):
-    PENDING = "PENDING"
-    VERIFIED = "VERIFIED"
-    NEEDS_REVIEW = "NEEDS_REVIEW"
-    REJECTED = "REJECTED"
+class RouterPort(Protocol):
+    def geocode(self, query_ascii: str, query_diacritic: str,
+                anchored_province_code: Optional[str]) -> Any: ...
 
 
-def make_idempotency_key(order_id: str, phone: str, raw_address: str) -> str:
-    normalized = unicodedata.normalize("NFC", (raw_address or "").strip().lower())
-    payload = f"{order_id.strip()}|{phone.strip()}|{normalized}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+def _candidate_from_obj(obj: Any, raw_input: str) -> Optional[AddressCandidate]:
+    if obj is None:
+        return None
+    data = obj if isinstance(obj, dict) else getattr(obj, "__dict__", {}) or {}
+    if isinstance(obj, AddressContract):
+        return AddressCandidate(address=obj, provider=ProviderSource.GOONG,
+                                provider_score=0.8, rank_score=0.8)
+    if isinstance(obj, AddressCandidate):
+        return obj
+    province_code = data.get("province_code")
+    if not province_code:
+        return None
+    contract = AddressContract(
+        raw_input=raw_input, province=data.get("province"), district=data.get("district"),
+        ward=data.get("ward"), street=data.get("street"), house_number=data.get("house_number"),
+        province_code=str(province_code), district_code=str(data["district_code"]) if data.get("district_code") else None,
+        ward_code=str(data["ward_code"]) if data.get("ward_code") else None,
+        lat=data.get("lat"), lng=data.get("lng"), source=ProviderSource.GOONG)
+    score = float(data.get("score", data.get("provider_score", 0.8)) or 0.8)
+    return AddressCandidate(address=contract, provider=ProviderSource.GOONG,
+                            provider_score=score, rank_score=score)
 
 
 @dataclass
-class AddressJob:
-    idempotency_key: str
-    order_id: str
-    shop_id: str
-    phone: str
-    raw_address: str
-    status: AddressStatus = AddressStatus.PENDING
-    resolved_address: dict | None = None
-    confidence: float = 0.0
-    reason: str | None = None
-    attempts: int = 0
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
-
-
-@dataclass
-class OutboxEvent:
-    event_id: str
-    idempotency_key: str
-    event_type: str  # address.verified | address.needs_review | address.rejected
-    payload: dict
-    published: bool = False
-
-
-class JobStore(Protocol):
-    def get_or_create(self, job: AddressJob) -> tuple[AddressJob, bool]: ...
-    def update(self, job: AddressJob) -> None: ...
-    def append_outbox(self, event: OutboxEvent) -> None: ...
-    def unpublished_outbox(self) -> list[OutboxEvent]: ...
-    def mark_published(self, event_id: str) -> None: ...
-
-
-class InMemoryStore:
-    """Store tham chiếu cho test/dev. Production thay bằng Postgres transaction."""
-    def __init__(self) -> None:
-        self._jobs: dict[str, AddressJob] = {}
-        self._outbox: list[OutboxEvent] = {}
-        self._outbox_list: list[OutboxEvent] = []
-        self._lock = asyncio.Lock()
-
-    def get_or_create(self, job: AddressJob) -> tuple[AddressJob, bool]:
-        if job.idempotency_key in self._jobs:
-            return self._jobs[job.idempotency_key], False
-        self._jobs[job.idempotency_key] = job
-        return job, True
-
-    def update(self, job: AddressJob) -> None:
-        job.updated_at = time.time()
-        self._jobs[job.idempotency_key] = job
-
-    def append_outbox(self, event: OutboxEvent) -> None:
-        self._outbox_list.append(event)
-
-    def unpublished_outbox(self) -> list[OutboxEvent]:
-        return [e for e in self._outbox_list if not e.published]
-
-    def mark_published(self, event_id: str) -> None:
-        for e in self._outbox_list:
-            if e.event_id == event_id:
-                e.published = True
-
-
-# Pipeline xử lý 1 địa chỉ, do api/gateway cung cấp:
-# (raw_address) -> (status, resolved_address, confidence, reason)
-PipelineFn = Callable[[str], Awaitable[tuple[AddressStatus, dict | None, float, str | None]]]
-
-MAX_ATTEMPTS = 3
-BASE_BACKOFF_SECONDS = 2.0
-
-
 class AddressService:
-    def __init__(self, store: JobStore, pipeline: PipelineFn,
-                 max_concurrency: int = 20) -> None:
-        self._store = store
-        self._pipeline = pipeline
-        self._queue: asyncio.Queue[AddressJob] = asyncio.Queue()
-        self._semaphore = asyncio.Semaphore(max_concurrency)
-        self.dead_letter_queue: list[AddressJob] = []
-        self._workers: list[asyncio.Task] = []
+    admin_index: AdminIndex
+    router: Optional[RouterPort] = None
+    validator: Optional[HierarchicalValidator] = None
+    gate: Optional[ConfidenceGate] = None
+    matcher: Optional[FuzzyMatcher] = None
+    ranker: Optional[Ranker] = None
+    guard: Optional[InputGuard] = None
 
-    # -- API đồng bộ phía đặt hàng: trả ngay PENDING, không chặn checkout --- #
-    async def submit(self, order_id: str, shop_id: str, phone: str,
-                     raw_address: str) -> AddressJob:
-        key = make_idempotency_key(order_id, phone, raw_address)
-        job, created = self._store.get_or_create(AddressJob(
-            idempotency_key=key, order_id=order_id, shop_id=shop_id,
-            phone=phone, raw_address=raw_address))
-        if created:
-            await self._queue.put(job)
-        # created=False nghĩa là webhook retry / khách bấm lại: trả job cũ,
-        # tuyệt đối không xử lý trùng, không tạo vận đơn thứ hai.
-        return job
+    def __post_init__(self) -> None:
+        self.validator = self.validator or HierarchicalValidator(index=self.admin_index)
+        self.gate = self.gate or ConfidenceGate()
+        self.matcher = self.matcher or FuzzyMatcher()
+        self.ranker = self.ranker or Ranker()
+        self.guard = self.guard or InputGuard()
 
-    def desired_workers(self, min_workers: int = 2, max_workers: int = 32) -> int:
-        """Tín hiệu auto-scale: ~100 job chờ thêm 1 worker, kẹp trong [min, max]."""
-        depth = self._queue.qsize()
-        return max(min_workers, min(max_workers, min_workers + depth // 100))
-
-    async def start(self, num_workers: int = 4) -> None:
-        self._workers = [asyncio.create_task(self._worker())
-                         for _ in range(num_workers)]
-
-    async def stop(self) -> None:
-        for w in self._workers:
-            w.cancel()
-        self._workers.clear()
-
-    async def _worker(self) -> None:
-        while True:
-            job = await self._queue.get()
+    def resolve(self, raw_input: str, carrier: str = "SPX") -> PipelineResult:
+        # 1. Normalize (không đoán, chỉ chuẩn hóa để so khớp)
+        normalized = normalize_text(raw_input or "")
+        base = AddressContract(raw_input=raw_input or "")
+        result = PipelineResult(contract=base, stage_reached=PipelineStage.NORMALIZE)
+        # 2. Parse trước guard để guard đếm cấp từ đoạn đã phân loại.
+        parsed = parse_address(raw_input or "")
+        result.stage_reached = PipelineStage.PARSE
+        # 3. InputGuard — chặn trước mọi provider call.
+        guard = self.guard.check(raw_input or "", parsed)
+        if not guard.passed:
+            return result.reject(PipelineStage.PARSE, guard.reason_code)
+        # 4. Anchor tỉnh.
+        anchor = anchor_province(raw_input or "", self.admin_index)
+        result.stage_reached = PipelineStage.ANCHOR
+        if not anchor.anchored or anchor.province is None:
+            return result.reject(PipelineStage.ANCHOR, ReasonCode.MISSING_PROVINCE)
+        # 5. Match trong tỉnh đã khóa (Canonical DB).
+        candidates = self.matcher.match(parsed, anchor, self.admin_index)
+        result.stage_reached = PipelineStage.MATCH
+        # 6. Geocode — router chỉ là gợi ý, luôn qua veto tỉnh ở Ranker.
+        if self.router is not None:
+            result.stage_reached = PipelineStage.GEOCODE
             try:
-                async with self._semaphore:
-                    await self._process_with_retry(job)
-            finally:
-                self._queue.task_done()
-
-    async def _process_with_retry(self, job: AddressJob) -> None:
-        while True:
-            job.attempts += 1
-            try:
-                status, resolved, confidence, reason = await self._pipeline(job.raw_address)
-                # Pipeline không bao giờ được trả VERIFIED rỗng.
-                if status == AddressStatus.VERIFIED and not resolved:
-                    status, reason = AddressStatus.NEEDS_REVIEW, "verified_without_payload"
-                job.status, job.resolved_address = status, resolved
-                job.confidence, job.reason = confidence, reason
-                self._store.update(job)
-                self._store.append_outbox(OutboxEvent(
-                    event_id=f"{job.idempotency_key}:{status.value}",
-                    idempotency_key=job.idempotency_key,
-                    event_type=f"address.{status.value.lower()}",
-                    payload={"order_id": job.order_id, "shop_id": job.shop_id,
-                             "status": status.value, "resolved_address": resolved,
-                             "confidence": confidence, "reason": reason}))
-                return
-            except Exception as exc:  # provider timeout, DB chập chờn...
-                if job.attempts >= MAX_ATTEMPTS:
-                    job.status = AddressStatus.NEEDS_REVIEW
-                    job.reason = f"pipeline_failed_after_retries: {type(exc).__name__}"
-                    self._store.update(job)
-                    self.dead_letter_queue.append(job)
-                    return
-                backoff = BASE_BACKOFF_SECONDS * (2 ** (job.attempts - 1))
-                await asyncio.sleep(backoff + random.uniform(0, backoff * 0.3))
-
-    async def relay_outbox(self, publish: Callable[[OutboxEvent], Awaitable[None]]) -> int:
-        """Relay chạy định kỳ: publish sự kiện chưa gửi, đánh dấu sau khi thành công."""
-        sent = 0
-        for event in self._store.unpublished_outbox():
-            await publish(event)
-            self._store.mark_published(event.event_id)
-            sent += 1
-        return sent
+                router_result = self.router.geocode(normalized, raw_input or "", anchor.province.code)
+                for obj in getattr(router_result, "candidates", []) or []:
+                    cand = _candidate_from_obj(obj, raw_input or "")
+                    if cand is not None:
+                        candidates.append(cand)
+            except Exception:
+                # Provider lỗi thì fail sang matcher nội bộ, không fail-open.
+                pass
+        if not candidates:
+            return result.reject(PipelineStage.MATCH, ReasonCode.MISSING_WARD)
+        # 7. Rank — veto lệch tỉnh, tính margin.
+        ranked = self.ranker.rank(candidates, anchor)
+        result.candidates = ranked.ranked
+        result.stage_reached = PipelineStage.RANK
+        if ranked.top1 is None:
+            return result.reject(PipelineStage.RANK, ReasonCode.PROVINCE_MISMATCH)
+        top = ranked.top1.address
+        # Điền chi tiết từ parser (số nhà/đường/thôn) lên ứng viên top-1;
+        # hành chính lấy từ candidate, không lấy từ provider thô.
+        contract = replace(
+            top, raw_input=raw_input or "",
+            house_number=parsed.house_number or top.house_number,
+            street=parsed.street or top.street, hamlet=parsed.hamlet or top.hamlet,
+            matched_tokens=parsed.matched_tokens, unmatched_tokens=parsed.unmatched_tokens,
+            source=top.source, status=AddressStatus.PENDING)
+        result.contract = contract
+        # 8. Validate phân cấp + hãng + GPS.
+        validation = self.validator.validate(contract, preferred_carrier=carrier)
+        result.stage_reached = PipelineStage.VALIDATE
+        if validation.decision == Decision.BLOCKED:
+            return result.reject(PipelineStage.VALIDATE, ReasonCode.HIERARCHY_CONFLICT)
+        # 9. Confidence Gate — chốt chặn cuối.
+        decision = self.gate.evaluate(contract, ranked.ranked)
+        result.stage_reached = PipelineStage.GATE
+        contract = replace(contract, confidence=decision.confidence_score,
+                           status=gate_to_address_status(decision.status),
+                           reason_code=decision.reason_code)
+        result.contract = contract
+        # 10. Commit — chỉ VERIFIED mới shippable; NEEDS_REVIEW/REJECTED không tạo nhãn.
+        result.stage_reached = PipelineStage.COMMIT
+        return result
