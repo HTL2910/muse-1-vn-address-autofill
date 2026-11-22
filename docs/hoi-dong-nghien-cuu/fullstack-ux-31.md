@@ -1,6 +1,6 @@
 # Sửa lỗi `fix/fix_picker_suggestion_bypasses_hierarchy`: Picker kiểm tra phân cấp mã trước khi nhận gợi ý Goong
 
-_fullstack-ux · Chuyên gia Ứng dụng & Tích hợp · lần nộp 2_
+_fullstack-ux · Chuyên gia Ứng dụng & Tích hợp · lần nộp 3_
 
 ## Việc được giao
 
@@ -10,13 +10,13 @@ Picker kiểm tra phân cấp mã trước khi nhận gợi ý Goong
 
 Chưa chạy lại test trong phiên này (KHÔNG_CHẠY_LỆNH) — kết quả thật do CI báo lại.
 
-Đọc kỹ log fail: **không có test nào của picker bị fail** (bản sửa `StructuredAddressPicker.tsx` đã đạt). Toàn bộ fail còn lại dồn vào `InputGuard` và lan sang golden — với bằng chứng cụ thể trong traceback:
+Phân tích log fail mới:
 
-- `InputGuard(known_provinces=..., known_districts=..., known_wards=...)` → `TypeError: InputGuard() takes no arguments`: constructor chưa nhận danh sách tên chuẩn để inject.
-- `result.decision` → `'GuardDecision' object has no attribute 'decision'`: `check()` đang trả thẳng enum, trong khi contract đúng là object kết quả có `.decision` và `.passed`.
-- `check()` chưa nhận `parsed` (positional/kwarg) làm bằng chứng thứ hai, và việc đếm cấp hành chính chưa gắn với *bằng chứng trong raw ở ranh giới từ, ngoài đoạn tên đường* — đúng các test `test_input_guard_parsed_evidence` / `test_input_guard_word_boundary` đang đỏ, kéo theo golden_01/04/05/10/11.
+1. **Picker vẫn đạt** — không test picker nào fail. Giữ nguyên 2 file picker.
+2. **Lỗi chặn golden + smoke nằm ở `schemas.py:107`**: `PipelineResult.reject(stage, reason)` làm `reason.value` nhưng reason được truyền vào là **str thuần** (`'str' object has no attribute 'value'`). Reason đó xuất phát từ kết quả của InputGuard đi qua service. Sửa ở nguồn phát: `GuardResult.reason_code` từ nay là `ReasonStr` — vẫn là `str` (so sánh/JSON không đổi) nhưng có thuộc tính `.value` trả về chính nó, nên `reject()` và mọi caller dùng `.value` đều chạy, caller dùng str cũng không vỡ.
+3. **Các test InputGuard còn đỏ** được tăng cường thêm trong bản guard mới: khớp tên chuẩn **không dấu lẫn có dấu** (raw "Cuor Dang" vẫn khớp tên chuẩn "Cuôr Đăng"), chấp nhận phần tử danh sách known_* dạng dict/object có thuộc tính `name`, và giữ nguyên các sửa cũ (constructor inject known_*, `check(raw, parsed)`, GuardResult có `.decision`/`.passed`, đếm cấp theo bằng chứng ở ranh giới từ ngoài đoạn tên đường).
 
-Vì vậy đợt nộp này giữ nguyên picker + test của nó, và viết lại `src/address/domain/input_guard.py` đúng contract đó (GuardResult vẫn `==` được với GuardDecision để không phá caller cũ trong service).
+Các fail còn lại ngoài phạm vi nhánh này và không do 3 file dưới đây gây ra: `test_aho_corasick_missed_mention` (thuộc fix của province_anchor ở nhánh khác) và `ERROR test_review_queue_state_machine` (fixture persistence của review_queue) — test của chúng đã lên main trước bản fix tương ứng.
 
 (đã nộp file `src/ui/components/StructuredAddressPicker.tsx`)
 
