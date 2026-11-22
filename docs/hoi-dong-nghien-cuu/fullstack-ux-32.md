@@ -1,6 +1,6 @@
 # Sửa lỗi `fix/fix_encoding_utf8`: Sửa mojibake UTF-8 và thêm CI kiểm tra encoding
 
-_fullstack-ux · Chuyên gia Ứng dụng & Tích hợp · lần nộp 2_
+_fullstack-ux · Chuyên gia Ứng dụng & Tích hợp · lần nộp 3_
 
 ## Việc được giao
 
@@ -10,9 +10,13 @@ Sửa mojibake UTF-8 và thêm CI kiểm tra encoding
 
 Chưa chạy lại test trong phiên này (KHÔNG_CHẠY_LỆNH) — kết quả thật do CI báo lại.
 
-Phân tích log: phần encoding cốt lõi đã đạt (docstring đúng, quét repo sạch, chuỗi mẫu nguyên vẹn). Chỉ còn 3 test của chính tôi bị `ERROR ... Permi...` — cả 3 đều là test dùng `tmp_path` để tạo cây thư mục tạm cho bộ quét (môi trường chạy test trên Windows, thư mục tạm gây PermissionError ở setup/teardown, cùng kiểu lỗi với test persistence của review_queue). Sửa tận gốc: tách lõi quét thành hàm thuần trên dữ liệu trong bộ nhớ `find_violations_in_bytes({đường_dẫn: bytes})`, `find_violations(root)` chỉ còn là lớp đọc đĩa (và lỗi đọc file được ghi thành vi phạm thay vì ném exception). 3 test đó chuyển sang API trong bộ nhớ — không chạm đĩa nữa. Các file còn lại giữ nguyên bản đã đạt.
+Đối chiếu log lần này với lần trước: **toàn bộ test encoding đã PASS** — danh sách fail không còn test nào của `tests/test_encoding_utf8.py`, và số test pass tăng 130 → 134 (đúng các test encoding mới: docstring đúng dấu, quét repo sạch, chuỗi mẫu, 3 test quét trong bộ nhớ, test thiếu chuỗi mẫu). Các fail còn lại nằm trọn ở 3 cụm ngoài phạm vi nhánh `fix/fix_encoding_utf8`:
 
-Các fail pipeline/golden/input_guard/aho trong log thuộc các nhánh fix khác chưa merge (guard ở tầng PARSE trả `MISSING_ADMIN_LEVELS` cho "xã Cuôr Đăng, Đắk Lắk" là lỗi của input_guard/province_anchor trên main hiện tại), không phát sinh từ thay đổi encoding này.
+- `test_input_guard_*`: GuardResult trên main còn thiếu thuộc tính `detected_levels` (log: `AttributeError ... 'detected_levels'` tại `test_input_guard_word_boundary.py:146`) và guard mặc định chưa có danh sách tỉnh tích hợp nên "xã Cuôr Đăng, Đắk Lắk" bị tính 1 cấp → `MISSING_ADMIN_LEVELS` ở tầng PARSE, kéo theo `test_pipeline_smoke::test_cuor_dang_dak_lak_never_hai_duong` và golden_03/10/11. Đây là phạm vi của nhánh fix input_guard.
+- `test_aho_corasick_missed_mention`: phạm vi nhánh fix province_anchor.
+- `ERROR test_review_queue_state_machine`: phạm vi nhánh fix review_queue.
+
+Nộp lại nguyên trạng bộ file encoding đã đạt để nhánh này merge độc lập; ba cụm trên cần merge từ đúng nhánh sở hữu, sửa chéo tại đây sẽ xung đột với các nhánh đó.
 
 (đã nộp file `src/__init__.py`)
 
