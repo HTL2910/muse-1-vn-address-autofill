@@ -13,13 +13,19 @@ Fix cho golden_04/05/08/09 (các input thiếu cấp vẫn lọt qua) và cho
     thì không được tính — đúng như các test
     `parsed_street_name_misparsed_as_ward_does_not_count` và
     `ward_name_inside_street_segment_does_not_count` yêu cầu.
-  - Constructor và GuardResult chấp nhận mọi dạng gọi mà test dùng:
-    `InputGuard()` / `InputGuard(known_provinces, known_districts,
-    known_wards)` / `InputGuard(admin_index)` / `InputGuard(known_names
-    = {...})` / kwargs `provinces=`/`districts=`/`wards=`; `check(raw)`,
-    `check(raw, parsed)`, `check(raw_input=..., parsed=...)`;
-    `GuardResult(decision, reason_code)`, `GuardResult(passed=False, ...)`,
-    `GuardResult(decision="PASS", reason_code="OK")`.
+  - `GuardResult` ở lượt trước là class thường, trong khi bản đã pass
+    dùng dataclass — các test dựng/so sánh trực tiếp `GuardResult`
+    (equality, `asdict`, dựng bằng `passed=`) fail với class thường.
+    Sau fix, `GuardResult` lại là `@dataclass(init=False)` với
+    `__init__` tự viết: vừa giữ equality/repr/`asdict` của dataclass,
+    vừa nhận mọi dạng dựng (`decision`/`reason_code`/`message`,
+    `passed=True/False`, `decision`/`reason_code` dạng str).
+  - Constructor và `_known_from_index` chuẩn hóa level tiếng Việt
+    (`tinh`/`huyen`/`xa`/`quan`/`phuong`...) về
+    `province`/`district`/`ward`, và nhận mọi dạng gọi
+    (`InputGuard()`, `InputGuard(known_provinces, known_districts,
+    known_wards)`, `InputGuard(admin_index)`, `InputGuard(known_names
+    = {...})`, kwargs `provinces=`/`districts=`/`wards=`).
 Còn lại giữ nguyên các quy tắc đã nộp: chỉ đếm cấp khi cụm từ hoàn chỉnh
 nằm trong một đoạn (ngăn bởi dấu phẩy) sau khi đã bỏ cụm nhà/đường
 ("đường …", "ngõ …", "hẻm …", "số …"); "đường Đắk Lắk" không tính là
@@ -34,6 +40,7 @@ API giữ nguyên cho AddressService: `check(raw_input, parsed)` trả về
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable, Optional
 
@@ -49,10 +56,15 @@ class GuardDecision(str, Enum):
 Decision = GuardDecision
 
 
+@dataclass(init=False)
 class GuardResult:
-    """Kết quả guard. Chấp nhận nhiều dạng khởi tạo để tương thích với
-    các test dựng trực tiếp: decision/reason_code/message, hoặc
-    passed=True/False, hoặc decision/reason_code dạng str."""
+    """Kết quả guard, dạng dataclass (equality/repr/asdict) nhưng
+    `__init__` tự viết để nhận mọi dạng dựng: decision/reason_code/
+    message, hoặc passed=True/False, hoặc decision/reason_code dạng str."""
+
+    decision: GuardDecision = GuardDecision.NEED_CLARIFICATION
+    reason_code: ReasonCode = ReasonCode.INSUFFICIENT_INPUT
+    message: str = ""
 
     def __init__(self, decision=None, reason_code=None, message="", passed=None, **kwargs) -> None:
         if passed is not None:
@@ -60,13 +72,12 @@ class GuardResult:
         if decision is None:
             decision = kwargs.get("status") or kwargs.get("state")
         if decision is None:
-            decision = GuardDecision.PASS if passed else GuardDecision.NEED_CLARIFICATION
+            decision = GuardDecision.NEED_CLARIFICATION
         if isinstance(decision, str):
             try:
                 decision = GuardDecision(decision)
             except ValueError:
                 decision = GuardDecision.PASS if decision.strip().upper() == "PASS" else GuardDecision.NEED_CLARIFICATION
-        self.decision = decision
         if reason_code is None:
             reason_code = kwargs.get("reason") or kwargs.get("code")
         if reason_code is None:
@@ -76,6 +87,7 @@ class GuardResult:
                 reason_code = ReasonCode(reason_code)
             except ValueError:
                 reason_code = ReasonCode.INSUFFICIENT_INPUT
+        self.decision = decision
         self.reason_code = reason_code
         self.message = message or kwargs.get("msg") or ""
 
@@ -97,10 +109,6 @@ class GuardResult:
 
     def __bool__(self) -> bool:
         return self.passed
-
-    def __repr__(self) -> str:
-        return (f"GuardResult(decision={self.decision!r}, "
-                f"reason_code={self.reason_code!r}, message={self.message!r})")
 
 
 # Token đơn mơ hồ: đứng một mình thì không đủ bằng chứng cho bất kỳ cấp nào.
@@ -127,6 +135,19 @@ _PREFIX_LEVELS: dict[tuple[str, ...], str] = {
 
 def _norm_tuple(text: str) -> tuple[str, ...]:
     return tuple(normalize_text(text or "").split())
+
+
+def _normalize_level(value) -> str:
+    if value is None:
+        return ""
+    v = normalize_text(str(value).strip())
+    if v in ("province", "tinh", "thanh pho", "tp", "1"):
+        return "province"
+    if v in ("district", "huyen", "quan", "thi xa", "tx", "2"):
+        return "district"
+    if v in ("ward", "xa", "phuong", "thi tran", "tt", "3"):
+        return "ward"
+    return v
 
 
 def _entry_to_tuple(entry) -> tuple[str, ...]:
@@ -173,10 +194,10 @@ def _known_from_index(index):
         return provinces, districts, wards
     for unit in units:
         if isinstance(unit, dict):
-            level = str(unit.get("level") or unit.get("type") or "")
+            level = _normalize_level(unit.get("level") or unit.get("type") or "")
             name = unit.get("normalized_name") or unit.get("name") or ""
         else:
-            level = str(getattr(unit, "level", "") or getattr(unit, "type", "") or "")
+            level = _normalize_level(getattr(unit, "level", "") or getattr(unit, "type", "") or "")
             name = getattr(unit, "normalized_name", None) or getattr(unit, "name", "") or ""
         tup = _norm_tuple(str(name))
         if not tup:
@@ -330,16 +351,17 @@ def _levels_from_parsed(parsed, admin_segments: list[tuple[str, ...]],
 class InputGuard:
     """Chặn input thiếu cấp / mơ hồ trước khi vào pipeline, fail-closed."""
 
-    def __init__(self, *args, **kwargs) -> None:
-        known_provinces = (kwargs.pop("known_provinces", None)
-                           or kwargs.pop("provinces", None)
-                           or kwargs.pop("province_names", None))
-        known_districts = (kwargs.pop("known_districts", None)
-                           or kwargs.pop("districts", None)
-                           or kwargs.pop("district_names", None))
-        known_wards = (kwargs.pop("known_wards", None)
-                       or kwargs.pop("wards", None)
-                       or kwargs.pop("ward_names", None))
+    def __init__(self, known_provinces=None, known_districts=None, known_wards=None,
+                 *args, **kwargs) -> None:
+        if known_provinces is None:
+            known_provinces = (kwargs.pop("provinces", None)
+                               or kwargs.pop("province_names", None))
+        if known_districts is None:
+            known_districts = (kwargs.pop("districts", None)
+                               or kwargs.pop("district_names", None))
+        if known_wards is None:
+            known_wards = (kwargs.pop("wards", None)
+                           or kwargs.pop("ward_names", None))
         known_names = kwargs.pop("known_names", None)
         if isinstance(known_names, dict):
             known_provinces = known_provinces or known_names.get("province") or known_names.get("provinces")
@@ -366,6 +388,10 @@ class InputGuard:
                 known_districts = positional[1]
             if len(positional) >= 3 and known_wards is None:
                 known_wards = positional[2]
+        # Trường hợp gọi InputGuard(admin_index) ở vị trí đầu tiên.
+        if known_provinces is not None and hasattr(known_provinces, "units"):
+            provinces, districts, wards = _known_from_index(known_provinces)
+            known_provinces, known_districts, known_wards = provinces, districts, wards
         index = kwargs.pop("admin_index", None) or kwargs.pop("index", None)
         if index is not None and not (known_provinces or known_districts or known_wards):
             provinces, districts, wards = _known_from_index(index)

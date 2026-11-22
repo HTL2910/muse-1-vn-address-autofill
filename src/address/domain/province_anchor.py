@@ -22,16 +22,22 @@ bị bỏ qua. Output được thu thập qua dict-suffix-link để các patter
 là hậu tố của pattern khác (ví dụ "lak" trong "dak lak", "he" trong
 "she") cũng được trả về.
 
-Hai lỗi hồi quy đã sửa thêm ở bản này (lượt chạy trước tự gây ra):
-  - extract_admin_mentions bắt isinstance(unit, AdminUnit): unit trong
-    index thật (đọc từ CSV / admin_boundary_store) không phải class này
-    nên mọi mention bị loại, anchor mất tỉnh. Giờ dùng duck-typing và
-    chuẩn hóa mọi unit (dict hay object, khóa level/type,
-    parent_code/parent) thành AdminUnit ngay khi nạp index.
-  - "dak lak" khớp cả pattern "lak" (huyện Lắk) ở trong lòng nó, làm
-    mention huyện bị nhiễm. Giờ giải quyết chồng lấn theo longest-match:
-    chỉ giữ match không chồng lấn với match đã giữ (dài hơn trước khi
-    cùng vị trí bắt đầu).
+Hai lỗi hồi quy đã sửa thêm (lượt chạy trước tự gây ra):
+  - Unit trong index thật có thể mang `normalized_name` được tính bằng
+    hàm khác (giữ dấu, giữ dấu nháy như "cu m'gar"), nên pattern có dấu
+    không bao giờ khớp text đã bỏ dấu của `normalize_text` — anchor
+    trả về `matched_tokens=[]` và `MISSING_PROVINCE` cho cả địa chỉ
+    đúng. Giờ `_as_admin_unit` LUÔN tính lại
+    `normalized_name = normalize_text(name)`, bất kể giá trị có sẵn.
+  - `level` trong index thật có thể là tiếng Việt (`tinh`/`huyen`/`xa`
+    ...) hoặc số (`1`/`2`/`3`). Giờ `_normalize_level` map chúng về
+    `province`/`district`/`ward` trước khi dùng.
+  - `AnchorResult` được thêm các trường service có thể đọc
+    (`matched_tokens`, `unmatched_tokens`, `reason_code`, `status`
+    dạng `AddressStatus` để `.value` vẫn dùng được).
+  - Match chồng lấn được giải quyết theo longest-match: tên nằm trong
+    lòng tên dài hơn (ví dụ "lak" trong "dak lak") không được tính là
+    một mention riêng.
 
 API giữ nguyên cho các caller hiện có (fuzzy_matcher, validator,
 ranker, address_service):
@@ -49,7 +55,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Iterable, NamedTuple, Optional
 
-from .schemas import normalize_text
+from .schemas import AddressStatus, ReasonCode, normalize_text
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +191,20 @@ def aho_corasick_search(text: str, patterns: Iterable) -> list[Match]:
 # Admin DB: AdminUnit / AdminIndex
 # ---------------------------------------------------------------------------
 
+def _normalize_level(value) -> str:
+    """Map tên cấp (tiếng Việt / số / tiếng Anh) về province/district/ward."""
+    if value is None:
+        return ""
+    v = normalize_text(str(value).strip())
+    if v in ("province", "tinh", "thanh pho", "tp", "1"):
+        return "province"
+    if v in ("district", "huyen", "quan", "thi xa", "tx", "2"):
+        return "district"
+    if v in ("ward", "xa", "phuong", "thi tran", "tt", "3"):
+        return "ward"
+    return v
+
+
 @dataclass
 class AdminUnit:
     code: str
@@ -198,21 +218,24 @@ class AdminUnit:
     def __post_init__(self) -> None:
         if not self.normalized_name and self.name:
             self.normalized_name = normalize_text(self.name)
+        self.level = _normalize_level(self.level)
 
 
 def _as_admin_unit(unit) -> Optional[AdminUnit]:
     """Chuẩn hóa mọi dạng unit (AdminUnit, dict CSV, object khác) thành
-    AdminUnit của file này, chấp nhận các tên khóa/thuộc tính khác nhau."""
+    AdminUnit của file này, chấp nhận các tên khóa/thuộc tính khác nhau.
+    `normalized_name` LUÔN được tính lại từ `name` bằng `normalize_text`
+    để pattern và text tìm kiếm dùng cùng một chuẩn (bỏ dấu, bỏ nháy)."""
     if unit is None:
         return None
     if isinstance(unit, AdminUnit):
-        if not unit.normalized_name and unit.name:
+        if unit.name:
             unit.normalized_name = normalize_text(unit.name)
+        unit.level = _normalize_level(unit.level)
         return unit
     if isinstance(unit, dict):
         code = unit.get("code") or unit.get("id") or ""
         name = unit.get("name") or ""
-        normalized = unit.get("normalized_name") or unit.get("normalized") or unit.get("normalizedName") or ""
         level = unit.get("level") or unit.get("type") or unit.get("admin_level") or ""
         parent = unit.get("parent_code") or unit.get("parent") or unit.get("parentCode")
         lat = unit.get("centroid_lat") or unit.get("lat")
@@ -220,7 +243,6 @@ def _as_admin_unit(unit) -> Optional[AdminUnit]:
     else:
         code = getattr(unit, "code", "") or getattr(unit, "id", "") or ""
         name = getattr(unit, "name", "") or ""
-        normalized = getattr(unit, "normalized_name", "") or getattr(unit, "normalized", "") or ""
         level = getattr(unit, "level", "") or getattr(unit, "type", "") or ""
         parent = getattr(unit, "parent_code", None)
         if parent is None:
@@ -229,8 +251,10 @@ def _as_admin_unit(unit) -> Optional[AdminUnit]:
         lng = getattr(unit, "centroid_lng", None)
     if not code and not name:
         return None
-    return AdminUnit(code=str(code), name=str(name), normalized_name=str(normalized or ""),
-                     level=str(level or ""), parent_code=(str(parent) if parent not in (None, "") else None),
+    normalized = normalize_text(str(name)) if name else ""
+    return AdminUnit(code=str(code), name=str(name), normalized_name=normalized,
+                     level=_normalize_level(level),
+                     parent_code=(str(parent) if parent not in (None, "") else None),
                      centroid_lat=lat, centroid_lng=lng)
 
 
@@ -437,10 +461,17 @@ class AnchorResult:
     confidence: float = 0.0
     reason: Optional[str] = None
     declared_province_code: Optional[str] = None
+    matched_tokens: list[str] = field(default_factory=list)
+    unmatched_tokens: list[str] = field(default_factory=list)
+    reason_code: Optional[ReasonCode] = None
 
     @property
     def province_code(self) -> Optional[str]:
         return self.province.code if self.province else None
+
+    @property
+    def status(self) -> AddressStatus:
+        return AddressStatus.VERIFIED if self.anchored else AddressStatus.REJECTED
 
 
 def anchor_province(raw_input: str, index,
@@ -455,18 +486,32 @@ def anchor_province(raw_input: str, index,
         if unit.code not in seen:
             seen.add(unit.code)
             provinces.append(unit)
+    all_tokens = normalize_text(raw_input or "").split()
+    matched_tokens: list[str] = []
+    for level_units in mentions.values():
+        for unit in level_units:
+            matched_tokens.extend(unit.normalized_name.split())
+    unmatched_tokens = [t for t in all_tokens if t not in matched_tokens]
     if not provinces:
         return AnchorResult(anchored=False, reason="NO_PROVINCE_MENTION",
-                            declared_province_code=declared_province_code)
+                            declared_province_code=declared_province_code,
+                            matched_tokens=matched_tokens, unmatched_tokens=unmatched_tokens,
+                            reason_code=ReasonCode.MISSING_PROVINCE)
     if len(provinces) > 1:
         return AnchorResult(anchored=False, reason="AMBIGUOUS_PROVINCE",
-                            declared_province_code=declared_province_code)
+                            declared_province_code=declared_province_code,
+                            matched_tokens=matched_tokens, unmatched_tokens=unmatched_tokens,
+                            reason_code=ReasonCode.PROVINCE_MISMATCH)
     province = provinces[0]
     if declared_province_code is not None and str(declared_province_code) != str(province.code):
         return AnchorResult(anchored=False, reason="PROVINCE_MISMATCH",
-                            declared_province_code=declared_province_code)
+                            declared_province_code=declared_province_code,
+                            matched_tokens=matched_tokens, unmatched_tokens=unmatched_tokens,
+                            reason_code=ReasonCode.PROVINCE_MISMATCH)
     return AnchorResult(anchored=True, province=province, matched_text=province.name,
-                        confidence=1.0, declared_province_code=declared_province_code)
+                        confidence=1.0, declared_province_code=declared_province_code,
+                        matched_tokens=matched_tokens, unmatched_tokens=unmatched_tokens,
+                        reason_code=ReasonCode.OK)
 
 
 # Alias cho caller dùng tên khác.
