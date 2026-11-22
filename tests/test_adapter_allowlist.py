@@ -2,6 +2,8 @@
 
 Chạy: python -m pytest tests/test_adapter_allowlist.py -v
 Không gọi Goong/Pancake/SPX thật; router/validator/labels đều là fake.
+Thêm ca mã thật không có tính prefix: 66/652/24211 vẫn phải qua
+hierarchy (parent_code thuộc validator, adapter chỉ kiểm tra định dạng).
 """
 from __future__ import annotations
 
@@ -109,12 +111,19 @@ def test_missing_ward_and_province_mismatch_no_label():
     assert record2.status == OrderAddressStatus.BLOCKED_CARRIER_MISMATCH
 
 
+def test_real_codes_without_prefix_property_still_pass():
+    # Mã thật không có tính prefix: 66 / 652 / 24211 vẫn hợp lệ ở adapter.
+    adapter, calls = _adapter(final=_final(province="66", district="652", ward="24211"))
+    record = adapter.process_draft(_draft(), "127", "127", "66")
+    assert calls["n"] == 1
+    assert record.status == OrderAddressStatus.COMMITTED
+
+
 def test_ok_verified_complete_creates_label_once_and_replays():
     adapter, calls = _adapter()
     record = adapter.process_draft(_draft(), "127", "127", "66")
     assert record.status == OrderAddressStatus.COMMITTED
     assert record.carrier_label_id == "LBL-1"
-    # Sửa raw_input sau commit vẫn không tạo nhãn thứ hai cho cùng đơn.
     record2 = adapter.process_draft(_draft(raw="số khác, xã Cuôr Đăng, Đắk Lắk"), "x", "x", "66")
     assert record2.status == OrderAddressStatus.COMMITTED
     assert record2.carrier_label_id == "LBL-1"

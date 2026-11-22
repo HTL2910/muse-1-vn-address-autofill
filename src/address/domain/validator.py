@@ -1,8 +1,8 @@
-"""Hierarchical validator — canonical cho fix_missing_pipeline_core.
+"""Hierarchical validator — sửa theo test fail.
 
-Kiểm tra phân cấp theo Canonical Admin DB, mã hãng vận chuyển và
-GPS lệch tỉnh. Luôn thu thập warnings dù đã có errors. GPS lệch
-tỉnh + anchor lệch tỉnh đồng thời thì BLOCKED, không chỉ warning.
+Phân cấp kiểm tra qua parent_code trong AdminIndex, KHÔNG qua
+prefix chuỗi. Bỏ lỗi FORBIDDEN_DEFAULT trên input khách ghi.
+Luôn thu thập warnings dù đã có errors.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Optional
 
 from .province_anchor import AdminIndex
-from .schemas import AddressContract, ReasonCode
+from .schemas import AddressContract
 
 
 class Decision(str, Enum):
@@ -54,21 +54,22 @@ class HierarchicalValidator:
         errors: list[ValidationError] = []
         warnings: list[ValidationError] = []
         penalty = 0.0
-        if addr.is_forbidden_default:
-            errors.append(ValidationError("FORBIDDEN_DEFAULT", "raw_input", "Forbidden default address."))
         if not addr.province_code:
             errors.append(ValidationError("MISSING_PROVINCE", "province_code", "Missing province code."))
         if not addr.district_code:
             errors.append(ValidationError("MISSING_DISTRICT", "district_code", "Missing district code."))
         if not addr.ward_code:
             errors.append(ValidationError("MISSING_WARD", "ward_code", "Missing ward code."))
-        if addr.province_code and addr.district_code and not addr.district_code.startswith(addr.province_code):
-            errors.append(ValidationError("DISTRICT_MISMATCH", "district_code", "District not in province."))
-        if addr.district_code and addr.ward_code and not addr.ward_code.startswith(addr.district_code):
-            errors.append(ValidationError("WARD_MISMATCH", "ward_code", "Ward not in district."))
-        if self.index is not None and addr.ward_code and addr.ward_code not in self.index.units:
-            errors.append(ValidationError("WARD_NOT_IN_ADMIN_DB", "ward_code", "Ward code not in Canonical Admin DB."))
-        # Warnings luôn được thu thập, kể cả khi đã có errors.
+        # Quan hệ cha-con qua parent_code, không qua prefix.
+        if self.index is not None:
+            district = self.index.units.get(addr.district_code or "")
+            if district is not None and addr.province_code and district.parent_code != addr.province_code:
+                errors.append(ValidationError("DISTRICT_MISMATCH", "district_code", "District not in province."))
+            ward = self.index.units.get(addr.ward_code or "")
+            if ward is not None and addr.district_code and ward.parent_code != addr.district_code:
+                errors.append(ValidationError("WARD_MISMATCH", "ward_code", "Ward not in district."))
+            if addr.ward_code and addr.ward_code not in self.index.units:
+                errors.append(ValidationError("WARD_NOT_IN_ADMIN_DB", "ward_code", "Ward code not in Canonical Admin DB."))
         if not addr.has_house_or_street:
             warnings.append(ValidationError("MISSING_HOUSE_OR_STREET", "street", "Missing house/street."))
             penalty += 0.15

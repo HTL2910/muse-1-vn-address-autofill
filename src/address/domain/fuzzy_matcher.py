@@ -1,8 +1,6 @@
-"""Fuzzy matcher — canonical cho fix_missing_pipeline_core.
-
-Khớp xã/huyện trong tỉnh đã neo. Nhánh exact-match áp dụng cùng
-veto tỉnh/huyện như nhánh thường, không return sớm với score 1.0
-khi huyện lệch.
+"""Fuzzy matcher — sửa theo test fail: veto huyện/xã qua parent_code,
+không qua prefix chuỗi. Fallback tra cứu theo tên đã parse trong
+tỉnh đã neo, để ca hợp lệ không bị mất ứng viên khi AC bỏ lỡ.
 """
 from __future__ import annotations
 
@@ -28,14 +26,38 @@ class FuzzyMatcher:
             return []
         scope = Scope(province_code=anchor.province.code)
         mentions = extract_admin_mentions(parsed.raw_input, index)
-        ward_units = [u for u in mentions.get("ward", []) if u.code.startswith(scope.province_code)]
-        district_units = [u for u in mentions.get("district", []) if u.code.startswith(scope.province_code)]
+        ward_units = [u for u in mentions.get("ward", [])]
+        district_units = [u for u in mentions.get("district", [])
+                          if u.parent_code == scope.province_code]
+        # Lọc ward: ward phải thuộc một huyện của tỉnh đã neo.
+        filtered_wards: list[AdminUnit] = []
+        for ward in ward_units:
+            district = index.units.get(ward.parent_code or "")
+            if district is not None and district.parent_code == scope.province_code:
+                filtered_wards.append(ward)
+            elif ward.parent_code is None:
+                filtered_wards.append(ward)
+        ward_units = filtered_wards
         if district_units and not scope.district_code:
             scope.district_code = district_units[0].code
+        # Fallback: tra theo tên đã parse (ward/district) trong tỉnh đã neo.
+        if not ward_units and parsed.ward_name:
+            target = normalize_text(parsed.ward_name)
+            for cand in index.inverted.get(target, []):
+                if cand.level != "ward":
+                    continue
+                district = index.units.get(cand.parent_code or "")
+                if district is not None and district.parent_code == scope.province_code:
+                    ward_units.append(cand)
+        if not district_units and parsed.district_name:
+            target = normalize_text(parsed.district_name)
+            for cand in index.inverted.get(target, []):
+                if cand.level == "district" and cand.parent_code == scope.province_code:
+                    district_units.append(cand)
+                    scope.district_code = cand.code
         candidates: list[AddressCandidate] = []
-        # Ưu tiên xã được nhắc tới; nếu huyện đã neo mà xã thuộc huyện khác thì veto.
         for ward in ward_units:
-            if scope.district_code and not ward.code.startswith(scope.district_code):
+            if scope.district_code and ward.parent_code != scope.district_code:
                 continue
             district = index.units.get(ward.parent_code) if ward.parent_code else None
             contract = AddressContract(
@@ -48,19 +70,17 @@ class FuzzyMatcher:
                                                provider_score=1.0, rank_score=1.0))
         if candidates:
             return candidates
-        # Fuzzy dự phòng trên toàn bộ xã trong tỉnh.
         target = normalize_text(parsed.ward_name) if parsed.ward_name else ""
         if not target:
             return []
         best: list[tuple[float, AdminUnit]] = []
-        for prov_code in [scope.province_code]:
-            for district in index.districts_of(prov_code):
-                if scope.district_code and district.code != scope.district_code:
-                    continue
-                for ward in index.wards_of(district.code):
-                    score = difflib.SequenceMatcher(None, target, ward.normalized_name).ratio()
-                    if score >= 0.85:
-                        best.append((score, ward))
+        for district in index.districts_of(scope.province_code):
+            if scope.district_code and district.code != scope.district_code:
+                continue
+            for ward in index.wards_of(district.code):
+                score = difflib.SequenceMatcher(None, target, ward.normalized_name).ratio()
+                if score >= 0.85:
+                    best.append((score, ward))
         best.sort(key=lambda x: x[0], reverse=True)
         for score, ward in best[:3]:
             district = index.units.get(ward.parent_code) if ward.parent_code else None
