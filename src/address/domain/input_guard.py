@@ -33,15 +33,19 @@ Sau fix:
     nhận diện tiền tố hành chính bằng regex có \\b (đã là ranh giới từ),
     để các caller cũ không bị vỡ.
 
-Tương thích interface (fix TypeError ở AddressService):
+Tương thích interface (fix TypeError / AttributeError ở AddressService):
   AddressService.resolve gọi `guard.check(raw_input, parsed)` với
-  `parsed` là ParsedAddress. Vì vậy `check` PHẢI nhận đối số thứ hai
-  `parsed=None` (cả dạng positional và keyword), và chấp nhận thêm
-  *args/**kwargs để không vỡ khi caller truyền thêm tham số. Mức đã
-  parse được tính thêm, nhưng chỉ khi tên parse khớp đúng tên chuẩn
-  của ĐÚNG cấp đó (token tuple bằng nhau), không substring — ví dụ
-  parsed.ward_name="Lam Sơn" (tên đường bị parse nhầm thành xã) sẽ
-  không được tính là xã nếu "Lam Sơn" không có trong known_wards.
+  `parsed` là ParsedAddress, rồi dùng `guard.passed` và
+  `guard.reason_code` ở `if not guard.passed: return result.reject(
+  PipelineStage.PARSE, guard.reason_code)`. Vì vậy:
+  - `check` PHẢI nhận đối số thứ hai `parsed=None` (cả dạng positional
+    và keyword), và chấp nhận thêm *args/**kwargs.
+  - `GuardResult` PHẢI có thuộc tính `passed` (True iff decision==PASS).
+  - `reason_code` PHẢI là `ReasonCode` trong `schemas.py`, không phải
+    `str`, nếu không `PipelineResult.reject` sẽ ghi `str` vào
+    `AddressContract.reason_code` và các chỗ dùng `.value` sẽ vỡ.
+  Mức đã parse được tính thêm, nhưng chỉ khi tên parse khớp đúng tên
+  chuẩn của ĐÚNG cấp đó (token tuple bằng nhau), không substring.
 """
 from __future__ import annotations
 
@@ -50,6 +54,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, Sequence
+
+from .schemas import ReasonCode
 
 __all__ = ["GuardDecision", "GuardResult", "InputGuard", "guard_address_input"]
 
@@ -97,12 +103,25 @@ class GuardDecision(str, Enum):
 class GuardResult:
     decision: GuardDecision
     raw: str
-    reason_code: str
+    reason_code: ReasonCode
     user_message: str  # tiếng Việt, hiển thị trực tiếp trên UI
     missing_fields: tuple[str, ...] = ()   # vd: ("province","district","ward")
     detected_levels: tuple[str, ...] = ()
     call_geocoder: bool = False  # luôn False khi không PASS
     allow_waybill: bool = False  # luôn False khi không PASS
+
+    # AddressService dùng guard.passed, không chỉ guard.decision.
+    @property
+    def passed(self) -> bool:
+        return self.decision == GuardDecision.PASS
+
+    @property
+    def is_pass(self) -> bool:
+        return self.passed
+
+    @property
+    def message(self) -> str:
+        return self.user_message
 
 
 def _strip_diacritics(text: str) -> str:
@@ -310,7 +329,8 @@ class InputGuard:
         text = (raw or "").strip()
         if not text:
             return GuardResult(GuardDecision.NEED_CLARIFICATION, raw or "",
-                               "empty_input", "Vui lòng nhập địa chỉ giao hàng.",
+                               ReasonCode.INSUFFICIENT_INPUT,
+                               "Vui lòng nhập địa chỉ giao hàng.",
                                missing_fields=("province", "district", "ward"))
 
         norm = _strip_diacritics(text).lower().strip()
@@ -319,19 +339,19 @@ class InputGuard:
 
         # 1. Chỉ gồm số: "73", "127" — không bao giờ là địa chỉ đầy đủ.
         if re.fullmatch(r"[\d\s,.\-#/]+", text):
-            return GuardResult(GuardDecision.REJECTED, text, "numeric_only",
+            return GuardResult(GuardDecision.REJECTED, text, ReasonCode.NUMBER_ONLY,
                                "Chỉ có số nhà thì chưa đủ để giao hàng. "
                                "Vui lòng nhập thêm đường, phường/xã, quận/huyện và tỉnh.",
                                missing_fields=("street", "ward", "district", "province"))
         # 2. Token mơ hồ 1-2 âm tiết: "bi", "Bị", "Xom".
         if norm in _AMBIGUOUS_TOKENS or (len(tokens) == 1 and len(tokens[0]) <= 3):
-            return GuardResult(GuardDecision.NEED_CLARIFICATION, text, "ambiguous_token",
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, text, ReasonCode.GENERIC_TOKEN_ONLY,
                                f"“{text}” quá chung chung, hệ thống không thể đoán xã/phường. "
                                "Vui lòng nhập đầy đủ phường/xã, quận/huyện và tỉnh.",
                                missing_fields=("ward", "district", "province"))
         # 3. Quá ngắn: < 10 ký tự chữ, hoặc < 3 ký tự có nghĩa.
         if len(_letters(text)) < MIN_TOTAL_LETTERS or meaningful_chars < MIN_MEANINGFUL_CHARS:
-            return GuardResult(GuardDecision.NEED_CLARIFICATION, text, "too_short",
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, text, ReasonCode.INPUT_TOO_SHORT,
                                "Địa chỉ quá ngắn. Vui lòng nhập thêm đường, "
                                "phường/xã, quận/huyện và tỉnh.",
                                missing_fields=("ward", "district", "province"))
@@ -342,7 +362,7 @@ class InputGuard:
         levels = self._detect_levels(text) | self._levels_from_parsed(parsed)
         has_street = bool(re.search(r"\b(duong|đường)\b", norm)) or bool(re.search(r"\d+", text))
         if has_street and len(levels) == 0:
-            return GuardResult(GuardDecision.NEED_CLARIFICATION, text, "street_only_no_admin",
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, text, ReasonCode.INSUFFICIENT_INPUT,
                                "Địa chỉ mới có số nhà và tên đường, còn thiếu "
                                "phường/xã, quận/huyện và tỉnh. Vui lòng bổ sung.",
                                missing_fields=("ward", "district", "province"),
@@ -350,12 +370,19 @@ class InputGuard:
         # 5. Yêu cầu tối thiểu 2 cấp hành chính.
         if len(levels) < MIN_ADMIN_LEVELS:
             missing = tuple(l for l in ("province", "district", "ward") if l not in levels)
-            return GuardResult(GuardDecision.NEED_CLARIFICATION, text, "insufficient_admin_levels",
+            reason = ReasonCode.INSUFFICIENT_INPUT
+            if missing:
+                reason = {
+                    "province": ReasonCode.MISSING_PROVINCE,
+                    "district": ReasonCode.MISSING_DISTRICT,
+                    "ward": ReasonCode.MISSING_WARD,
+                }.get(missing[0], ReasonCode.INSUFFICIENT_INPUT)
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, text, reason,
                                "Địa chỉ chưa đủ cấp hành chính để giao hàng chính xác. "
                                "Vui lòng bổ sung tỉnh, quận/huyện hoặc phường/xã.",
                                missing_fields=missing,
                                detected_levels=tuple(sorted(levels)))
-        return GuardResult(GuardDecision.PASS, text, "ok", "",
+        return GuardResult(GuardDecision.PASS, text, ReasonCode.OK, "",
                            detected_levels=tuple(sorted(levels)),
                            call_geocoder=True, allow_waybill=True)
 

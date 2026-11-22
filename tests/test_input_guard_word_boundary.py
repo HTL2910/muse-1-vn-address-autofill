@@ -3,7 +3,8 @@
 Tên hành chính chỉ được tính khi khớp theo ranh giới từ trong một đoạn,
 sau khi loại cụm đường/số nhà — không được tính bằng substring.
 Đồng thời check() phải nhận được ParsedAddress làm đối số thứ hai như
-AddressService.resolve gọi: guard.check(raw_input, parsed).
+AddressService.resolve gọi: guard.check(raw_input, parsed), và trả về
+GuardResult có .passed và .reason_code là ReasonCode (không phải str).
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.address.domain.input_guard import GuardDecision, InputGuard
+from src.address.domain.schemas import ReasonCode
 
 
 def _guard():
@@ -38,6 +40,9 @@ def test_check_accepts_parsed_as_second_positional_arg():
         _parsed_cuor_dang(),
     )
     assert result.decision == GuardDecision.PASS
+    assert result.passed is True
+    assert result.reason_code == ReasonCode.OK
+    assert isinstance(result.reason_code, ReasonCode)
     assert result.allow_waybill is True
     assert result.call_geocoder is True
 
@@ -48,6 +53,15 @@ def test_check_accepts_parsed_as_keyword_arg():
         parsed=_parsed_cuor_dang(),
     )
     assert result.decision == GuardDecision.PASS
+    assert result.passed is True
+
+
+def test_guard_result_passed_is_false_when_not_pass():
+    result = _guard().check("73")
+    assert result.passed is False
+    assert result.decision == GuardDecision.REJECTED
+    assert result.reason_code == ReasonCode.NUMBER_ONLY
+    assert isinstance(result.reason_code, ReasonCode)
 
 
 def test_parsed_street_name_misparsed_as_ward_does_not_count():
@@ -58,6 +72,7 @@ def test_parsed_street_name_misparsed_as_ward_does_not_count():
     )
     result = _guard().check("Sói 799, đường Lam Sơn", parsed)
     assert result.decision == GuardDecision.NEED_CLARIFICATION
+    assert result.passed is False
     assert "ward" not in result.detected_levels
     assert result.allow_waybill is False
 
@@ -66,6 +81,7 @@ def test_street_name_containing_province_does_not_count():
     """'đường Đắk Lắk' là tên đường, không phải tỉnh Đắk Lắk."""
     result = _guard().check("Số 10, đường Đắk Lắk")
     assert result.decision != GuardDecision.PASS
+    assert result.passed is False
     assert result.allow_waybill is False
     assert result.call_geocoder is False
     assert "province" not in result.detected_levels
@@ -91,6 +107,7 @@ def test_real_province_and_ward_pass():
     """'xã Cuôr Đăng, Đắk Lắk': xã và tỉnh đứng riêng từng đoạn -> PASS."""
     result = _guard().check("xã Cuôr Đăng, Đắk Lắk")
     assert result.decision == GuardDecision.PASS
+    assert result.passed is True
     assert result.allow_waybill is True
     assert result.call_geocoder is True
     assert "province" in result.detected_levels
@@ -116,6 +133,7 @@ def test_short_inputs_still_rejected_or_clarified():
     for raw in ("73", "127", "bi", "Bị", "Xom", "Sói 799, đường Lam Sơn"):
         result = _guard().check(raw)
         assert result.decision in (GuardDecision.REJECTED, GuardDecision.NEED_CLARIFICATION), raw
+        assert result.passed is False, raw
         assert result.allow_waybill is False, raw
         assert result.call_geocoder is False, raw
 
@@ -124,4 +142,5 @@ def test_no_known_names_fallback_still_works():
     """Không inject tên chuẩn thì fallback tiền tố có \\b vẫn tính cấp."""
     result = InputGuard().check("Phường Bến Nghé, Quận 1")
     assert result.decision == GuardDecision.PASS
+    assert result.passed is True
     assert set(result.detected_levels) == {"district", "ward"}
