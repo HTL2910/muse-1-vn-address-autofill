@@ -1,6 +1,6 @@
 # Sửa lỗi `fix/fix_observability_dead_code`: Xóa code chết regionLock và sửa tỉ lệ forbidden_default
 
-_fullstack-ux · Chuyên gia Ứng dụng & Tích hợp · lần nộp 2_
+_fullstack-ux · Chuyên gia Ứng dụng & Tích hợp · lần nộp 3_
 
 ## Việc được giao
 
@@ -10,9 +10,13 @@ Xóa code chết regionLock và sửa tỉ lệ forbidden_default
 
 Chưa chạy lại test trong phiên này (KHÔNG_CHẠY_LỆNH) — kết quả thật do CI báo lại.
 
-Chỉ còn đúng 1 test của nhánh này bị đỏ: `test_no_dead_region_lock_code` — và lỗi nằm ở *cách test kiểm tra*, không phải ở bản sửa: test cũ quét chuỗi thô nên tự bắt phải chữ `regionLock` và `self.region_lock =` xuất hiện trong **docstring/comment mô tả lại lỗi cũ** của chính file `observability.py`. Các test chức năng còn lại (giữ đúng object lock, tỉ lệ forbidden theo số ca = 1.0/0.5/0.0, chữ ký hàm) đều đã pass.
+Đối chiếu log: **toàn bộ test của nhánh `fix_observability_dead_code` đã PASS** — danh sách fail không còn `tests/test_observability_dead_code.py` nào, số pass tăng 139 → 140. Các fail còn lại giữ nguyên ở 3 cụm ngoài phạm vi nhánh này, không thay đổi bởi file observability:
 
-Sửa test sang kiểm tra bằng AST: đếm node gán `self.region_lock` thật trong cây cú pháp (đúng 1) và khẳng định không còn node tên `regionLock` nào trong code — miễn nhiễm với comment/docstring. File `observability.py` giữ nguyên bản đã đạt.
+- `test_input_guard_*` (thiếu `detected_levels` trên GuardResult, guard chưa có danh sách tỉnh mặc định nên "xã Cuôr Đăng, Đắk Lắk" bị `MISSING_ADMIN_LEVELS`, kéo theo pipeline smoke + golden_03/10/11) — nhánh fix input_guard.
+- `test_aho_corasick_missed_mention` — nhánh fix province_anchor.
+- `ERROR test_review_queue_state_machine` — nhánh fix review_queue.
+
+Nộp lại nguyên trạng 2 file của nhánh này để merge độc lập.
 
 (đã nộp file `src/address/infrastructure/observability.py`)
 
