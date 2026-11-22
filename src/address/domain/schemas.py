@@ -1,7 +1,4 @@
 """Address Contract duy nhất — approach_01, canonical.
-Phân cấp KHÔNG kiểm tra bằng prefix chuỗi (mã thật 66/652, 01/001
-không có tính prefix); parent_code trong AdminIndex mới là nguồn
-sự thật. PipelineResult.reject giữ mã/tên đã resolve.
 Fix fix_schemas_forbidden_default_crash: __post_init__ không bao giờ
 raise — mã sai, confidence ngoài [0,1], địa chỉ mặc định cấm đều
 thành contract fail-closed (REJECTED + reason_code rõ ràng)."""

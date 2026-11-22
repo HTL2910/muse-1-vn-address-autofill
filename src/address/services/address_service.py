@@ -1,8 +1,9 @@
 """AddressService — entry duy nhất.
-Fix anchor: index được truyền vào mà RỖNG (không có tỉnh) thì
-không được dùng — object rỗng vẫn truthy nên `or` không cứu được.
-Service hợp nhất index truyền vào + CSV + seed (seed chỉ bù mã
-chưa có), nên anchor luôn có Đắk Lắk/Gia Lai/Hồ Chí Minh để neo."""
+Fix: (1) thứ tự hợp nhất index: index test truyền vào trước,
+CSV sau, seed cuối — seed không được ghi đè mã thật (Cư M'gar
+660 / Cuôr Đăng 66011, không phải 652/65211); (2) cấm default
+trần được kiểm tra trực tiếp trong service, không phụ thuộc
+gate bên ngoài; (3) index rỗng không được dùng."""
 from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Optional, Protocol
@@ -11,7 +12,7 @@ from ..domain.fuzzy_matcher import FuzzyMatcher
 from ..domain.input_guard import InputGuard
 from ..domain.province_anchor import AdminIndex, AdminUnit, anchor_province
 from ..domain.ranker import Ranker
-from ..domain.schemas import AddressCandidate, AddressContract, AddressStatus, PipelineResult, PipelineStage, ProviderSource, ReasonCode, gate_to_address_status, normalize_text
+from ..domain.schemas import AddressCandidate, AddressContract, AddressStatus, PipelineResult, PipelineStage, ProviderSource, ReasonCode, gate_to_address_status, is_forbidden_default, normalize_text
 from ..domain.structured_parser import parse_address
 from ..domain.validator import Decision, HierarchicalValidator
 class RouterPort(Protocol):
@@ -19,23 +20,23 @@ class RouterPort(Protocol):
 def _seed_index() -> AdminIndex:
     units=[
         AdminUnit("66","Đắk Lắk","province",None,("dak lak",),12.7,108.0),
-        AdminUnit("652","Cư M'gar","district","66",(),12.8,108.1),
-        AdminUnit("65211","Cuôr Đăng","ward","652",("cuor dang",),12.8,108.1),
+        AdminUnit("660","Cư M'gar","district","66",(),12.8,108.1),
+        AdminUnit("66011","Cuôr Đăng","ward","660",("cuor dang",),12.8,108.1),
         AdminUnit("64","Gia Lai","province",None,("gia lai",),13.9,108.0),
-        AdminUnit("635","Mang Yang","district","64",(),13.9,108.0),
-        AdminUnit("63501","Đăk Yă","ward","635",("dak ya",),13.9,108.0),
+        AdminUnit("637","Mang Yang","district","64",(),13.9,108.0),
+        AdminUnit("63701","Đăk Yă","ward","637",("dak ya",),13.9,108.0),
         AdminUnit("22","Hải Dương","province",None,("hai duong",),20.9,106.3),
-        AdminUnit("220","Chí Linh","district","22",(),21.1,106.3),
-        AdminUnit("22001","Phả Lại","ward","220",("pha lai",),21.1,106.3),
+        AdminUnit("290","Chí Linh","district","22",(),21.1,106.3),
+        AdminUnit("29001","Phả Lại","ward","290",("pha lai",),21.1,106.3),
         AdminUnit("40","Nghệ An","province",None,(),19.0,105.0),
-        AdminUnit("400","Thanh Chương","district","40",(),19.0,105.0),
-        AdminUnit("40001","Thanh Mỹ","ward","400",(),19.0,105.0),
+        AdminUnit("428","Thanh Chương","district","40",(),19.0,105.0),
+        AdminUnit("42801","Thanh Mỹ","ward","428",(),19.0,105.0),
         AdminUnit("04","Cao Bằng","province",None,(),22.6,106.2),
-        AdminUnit("040","Hòa An","district","04",(),22.6,106.2),
-        AdminUnit("04001","Hợp Giang","ward","040",(),22.6,106.2),
+        AdminUnit("048","Hòa An","district","04",(),22.6,106.2),
+        AdminUnit("04801","Hợp Giang","ward","048",(),22.6,106.2),
         AdminUnit("33","Hưng Yên","province",None,(),20.8,106.0),
-        AdminUnit("330","Kim Động","district","33",(),20.8,106.0),
-        AdminUnit("33001","Hiến Nam","ward","330",(),20.8,106.0),
+        AdminUnit("323","Hưng Yên","district","33",(),20.8,106.0),
+        AdminUnit("32301","Hiến Nam","ward","323",(),20.8,106.0),
         AdminUnit("74","Bình Dương","province",None,(),11.0,106.6),
         AdminUnit("740","Thủ Dầu Một","district","74",(),11.0,106.6),
         AdminUnit("74001","Phú Cường","ward","740",(),11.0,106.6),
@@ -53,14 +54,13 @@ def _load_default_index() -> AdminIndex:
     except Exception: pass
     return _seed_index()
 def _combined_index(admin_index: Any) -> AdminIndex:
-    """Hợp nhất index truyền vào + CSV + seed; seed chỉ bù mã chưa có,
-    không ghi đè mã thật từ CSV/index truyền vào."""
     merged: dict[str, AdminUnit] = {}
-    for idx in (_load_default_index(), admin_index):
+    # Ưu tiên: index truyền vào > CSV > seed. Seed chỉ bù mã chưa có.
+    for idx in (admin_index, _load_default_index(), _seed_index()):
         if idx is None: continue
         units = getattr(idx, "units", None)
         if isinstance(units, dict):
-            for code, unit in units.values() if False else units.items():
+            for code, unit in units.items():
                 if code not in merged: merged[code]=unit
         elif isinstance(idx, (list, tuple)):
             for unit in idx:
@@ -105,8 +105,14 @@ class AddressService:
         top=ranked.top1.address
         contract=replace(top,raw_input=raw_input or "",house_number=parsed.house_number or top.house_number,street=parsed.street or top.street,hamlet=parsed.hamlet or top.hamlet,matched_tokens=parsed.matched_tokens,unmatched_tokens=parsed.unmatched_tokens,source=top.source,status=AddressStatus.PENDING)
         result.contract=contract
+        # Cấm default trần: kiểm tra trực tiếp ở service, không phụ
+        # thuộc gate bên ngoài (gate có thể là bản khác trên main).
+        if is_forbidden_default(raw_input or "") and not contract.has_house_or_street:
+            return result.reject(PipelineStage.GATE,ReasonCode.FORBIDDEN_DEFAULT)
         validation=self.validator.validate(contract,preferred_carrier=carrier); result.stage_reached=PipelineStage.VALIDATE
         if validation.decision==Decision.BLOCKED: return result.reject(PipelineStage.VALIDATE,ReasonCode.HIERARCHY_CONFLICT)
         decision=self.gate.evaluate(contract,ranked.ranked); result.stage_reached=PipelineStage.GATE
+        if is_forbidden_default(raw_input or "") and not contract.has_house_or_street:
+            return result.reject(PipelineStage.GATE,ReasonCode.FORBIDDEN_DEFAULT)
         contract=replace(contract,confidence=decision.confidence_score,status=gate_to_address_status(decision.status),reason_code=decision.reason_code); result.contract=contract; result.stage_reached=PipelineStage.COMMIT
         return result
