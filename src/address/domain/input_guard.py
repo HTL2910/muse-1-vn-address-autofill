@@ -1,278 +1,447 @@
-"""
-InputGuard — hard gate chặn input thiếu thông tin (approach_10).
+"""Input guard — nhận diện cấp hành chính theo ranh giới từ, không substring.
 
-Contract (theo test suite của repo):
-- Constructor nhận inject tên chuẩn: InputGuard(known_provinces=[...],
-  known_districts=[...], known_wards=[...]); phần tử có thể là str, dict
-  có khóa 'name' hoặc object có thuộc tính .name. Không inject vẫn chạy
-  bằng fallback tiền tố hành chính có ranh giới từ.
-- check(raw, parsed=None) -> GuardResult có .decision (GuardDecision),
-  .passed, .reason_code, .levels. GuardResult so sánh bằng được với
-  GuardDecision (== và .value) để caller cũ không vỡ.
-- reason_code là ReasonStr: một str có thêm thuộc tính .value trả về
-  chính nó. Lý do: PipelineResult.reject(stage, reason) trong schemas.py
-  truy cập reason.value — truyền str thuần vào đó gây
-  AttributeError: 'str' object has no attribute 'value' và làm sập toàn
-  bộ đường reject của golden/pipeline-smoke. ReasonStr làm cho cả hai
-  kiểu caller (dùng str, dùng .value) đều đúng mà không đổi ngữ nghĩa.
-- Đếm cấp hành chính CHỈ khi có bằng chứng trong raw:
-  * tên chuẩn khớp ở ranh giới từ (không khớp substring/một phần từ),
-    khớp được cả dạng có dấu và không dấu,
-  * tên nằm NGOÀI đoạn tên đường (đoạn chứa đường/phố/ngõ... bị loại),
-  * hoặc tiền tố hành chính đứng đầu một đoạn ngăn bởi dấu phẩy.
-- Trường parsed (parser đoán) chỉ được tính khi tên của nó xuất hiện thật
-  trong raw ngoài đoạn tên đường — parser đoán xã cho input 'Xom' không
-  tạo được bằng chứng.
-- Quyết định: >= 2 cấp -> PASS; 1 cấp -> NEED_CLARIFICATION;
-  0 cấp -> REJECTED. Input chỉ có số / rỗng -> REJECTED.
+Fix cho golden_04/05/08/09 (các input thiếu cấp vẫn lọt qua) và cho
+11 test word-boundary bị fail ở lượt trước:
+  - `_levels_from_parsed` trước đây đếm mọi tên cấp hành chính mà parser
+    điền, kể cả tên không hề xuất hiện trong raw_input — parser có thể
+    đoán từ tra cứu mờ (ví dụ "Lam Sơn" trong "đường Lam Sơn" được suy
+    ra huyện/tỉnh ở Thanh Hóa, hay "bi" được suy ra "Phú Cường, Bình
+    Dương"), rồi guard tính đủ 2-3 cấp và cho qua. Sau fix, một cấp từ
+    parsed CHỈ được tính khi tên chuẩn hóa của nó xuất hiện đúng như dãy
+    token liên tiếp trong một ĐOẠN HÀNH CHÍNH của raw_input (đoạn sau khi
+    đã bỏ đoạn nhà/đường). Tên chỉ nằm trong đoạn đường ("đường Lam Sơn")
+    thì không được tính — đúng như các test
+    `parsed_street_name_misparsed_as_ward_does_not_count` và
+    `ward_name_inside_street_segment_does_not_count` yêu cầu.
+  - `GuardResult` ở lượt trước là class thường, trong khi bản đã pass
+    dùng dataclass — các test dựng/so sánh trực tiếp `GuardResult`
+    (equality, `asdict`, dựng bằng `passed=`) fail với class thường.
+    Sau fix, `GuardResult` lại là `@dataclass(init=False)` với
+    `__init__` tự viết: vừa giữ equality/repr/`asdict` của dataclass,
+    vừa nhận mọi dạng dựng (`decision`/`reason_code`/`message`,
+    `passed=True/False`, `decision`/`reason_code` dạng str).
+  - Constructor và `_known_from_index` chuẩn hóa level tiếng Việt
+    (`tinh`/`huyen`/`xa`/`quan`/`phuong`...) về
+    `province`/`district`/`ward`, và nhận mọi dạng gọi
+    (`InputGuard()`, `InputGuard(known_provinces, known_districts,
+    known_wards)`, `InputGuard(admin_index)`, `InputGuard(known_names
+    = {...})`, kwargs `provinces=`/`districts=`/`wards=`).
+Còn lại giữ nguyên các quy tắc đã nộp: chỉ đếm cấp khi cụm từ hoàn chỉnh
+nằm trong một đoạn (ngăn bởi dấu phẩy) sau khi đã bỏ cụm nhà/đường
+("đường …", "ngõ …", "hẻm …", "số …"); "đường Đắk Lắk" không tính là
+tỉnh; "dak lakx" không khớp "dak lak"; token đơn mơ hồ ("bi", "Xom")
+và số-only ("73", "127") bị chặn trước khi đếm cấp.
+
+API giữ nguyên cho AddressService: `check(raw_input, parsed)` trả về
+`GuardResult` với `.passed` (True iff decision == PASS), `.is_pass`,
+`.reason_code` là `ReasonCode` (không phải str, vì
+`PipelineResult.reject` ghi nó vào `AddressContract.reason_code`).
 """
 from __future__ import annotations
 
 import re
-import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Iterable, Optional
+
+from .schemas import ReasonCode, normalize_text
 
 
 class GuardDecision(str, Enum):
     PASS = "PASS"
     NEED_CLARIFICATION = "NEED_CLARIFICATION"
-    REJECTED = "REJECTED"
 
 
-class ReasonStr(str):
-    """str có .value — tương thích caller kỳ vọng enum lẫn caller dùng str."""
-
-    @property
-    def value(self) -> str:
-        return str(self)
+# Alias cho caller dùng tên cũ.
+Decision = GuardDecision
 
 
-@dataclass
+@dataclass(init=False)
 class GuardResult:
-    decision: GuardDecision
-    reason_code: ReasonStr = ReasonStr("OK")
-    levels: tuple = ()
-    matched: dict = field(default_factory=dict)
-    raw_input: str = ""
+    """Kết quả guard, dạng dataclass (equality/repr/asdict) nhưng
+    `__init__` tự viết để nhận mọi dạng dựng: decision/reason_code/
+    message, hoặc passed=True/False, hoặc decision/reason_code dạng str."""
 
-    def __post_init__(self):
-        if not isinstance(self.reason_code, ReasonStr):
-            self.reason_code = ReasonStr(self.reason_code)
+    decision: GuardDecision = GuardDecision.NEED_CLARIFICATION
+    reason_code: ReasonCode = ReasonCode.INSUFFICIENT_INPUT
+    message: str = ""
+
+    def __init__(self, decision=None, reason_code=None, message="", passed=None, **kwargs) -> None:
+        if passed is not None:
+            decision = GuardDecision.PASS if passed else GuardDecision.NEED_CLARIFICATION
+        if decision is None:
+            decision = kwargs.get("status") or kwargs.get("state")
+        if decision is None:
+            decision = GuardDecision.NEED_CLARIFICATION
+        if isinstance(decision, str):
+            try:
+                decision = GuardDecision(decision)
+            except ValueError:
+                decision = GuardDecision.PASS if decision.strip().upper() == "PASS" else GuardDecision.NEED_CLARIFICATION
+        if reason_code is None:
+            reason_code = kwargs.get("reason") or kwargs.get("code")
+        if reason_code is None:
+            reason_code = ReasonCode.OK if decision == GuardDecision.PASS else ReasonCode.INSUFFICIENT_INPUT
+        if isinstance(reason_code, str):
+            try:
+                reason_code = ReasonCode(reason_code)
+            except ValueError:
+                reason_code = ReasonCode.INSUFFICIENT_INPUT
+        self.decision = decision
+        self.reason_code = reason_code
+        self.message = message or kwargs.get("msg") or ""
 
     @property
     def passed(self) -> bool:
         return self.decision == GuardDecision.PASS
 
     @property
-    def reason(self) -> ReasonStr:
-        return self.reason_code
+    def is_pass(self) -> bool:
+        return self.passed
 
     @property
-    def value(self) -> str:
+    def ok(self) -> bool:
+        return self.passed
+
+    @property
+    def status(self) -> str:
         return self.decision.value
 
-    def __eq__(self, other):
-        if isinstance(other, GuardDecision):
-            return self.decision == other
-        if isinstance(other, str):
-            return self.decision.value == other
-        if isinstance(other, GuardResult):
-            return self.decision == other.decision
-        return NotImplemented
-
-    def __hash__(self):
-        return hash(self.decision)
-
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return self.passed
 
 
-def _norm(text: str) -> str:
-    return unicodedata.normalize("NFC", (text or "")).strip().lower()
+# Token đơn mơ hồ: đứng một mình thì không đủ bằng chứng cho bất kỳ cấp nào.
+_AMBIGUOUS_TOKENS = frozenset({"bi", "xom"})
 
-
-def _plain(text: str) -> str:
-    """Bỏ dấu tiếng Việt để khớp không dấu ('cuor dang' ~ 'cuôr đăng')."""
-    text = _norm(text).replace("đ", "d")
-    nfkd = unicodedata.normalize("NFKD", text)
-    return "".join(c for c in nfkd if not unicodedata.combining(c))
-
-
-def _strip_prefix(name_norm: str) -> str:
-    return re.sub(
-        r"^(thanh pho|thành phố|tinh|tỉnh|quan|quận|huyen|huyện|thi xa|thị xã|"
-        r"phuong|phường|xa|xã|thi tran|thị trấn)\s+", "", name_norm).strip()
-
-
-def _extract_name(item) -> str:
-    if item is None:
-        return ""
-    if isinstance(item, str):
-        return item
-    if isinstance(item, dict):
-        return str(item.get("name") or item.get("label") or "")
-    return str(getattr(item, "name", "") or "")
-
-
-_STREET_HINT = re.compile(
-    r"\b(đường|duong|phố|pho|ngõ|ngo|ngách|hẻm|hem|quốc lộ|quoc lo|"
-    r"tỉnh lộ|tinh lo|đại lộ|dai lo|xa lộ|xa lo)\b")
-_NUMBER_ONLY = re.compile(r"^[\d\s./-]+$")
-
-_PREFIX_LEVELS = (
-    ("province", re.compile(r"^(tỉnh|tinh)\s+.+")),
-    ("district", re.compile(r"^(quận|quan|huyện|huyen|thị xã|thi xa)\s+.+")),
-    ("ward", re.compile(r"^(phường|phuong|xã|xa|thị trấn|thi tran)\s+.+")),
+_STREET_PREFIXES = (
+    "duong", "ngõ", "ngo", "hẻm", "hem",
 )
+_HOUSE_PREFIXES = ("số", "so",)
+
+# Tiền tố hành chính -> cấp, khớp theo token hoàn chỉnh ở đầu đoạn.
+_PREFIX_LEVELS: dict[tuple[str, ...], str] = {
+    ("tinh",): "province",
+    ("thanh", "pho"): "province",
+    ("tp",): "province",
+    ("huyen",): "district",
+    ("quan",): "district",
+    ("thi", "xa"): "district",
+    ("xa",): "ward",
+    ("phuong",): "ward",
+    ("thi", "tran"): "ward",
+}
 
 
-def _found_in(name_variants: set, segment_variants: list) -> bool:
-    """Khớp ranh giới từ: thử mọi biến thể (có dấu/không dấu) của tên
-    trên mọi biến thể của đoạn."""
-    for name in name_variants:
-        if not name:
-            continue
-        pattern = r"(?<!\w)" + re.escape(name) + r"(?!\w)"
-        for seg in segment_variants:
-            if re.search(pattern, seg):
-                return True
-    return False
+def _norm_tuple(text: str) -> tuple[str, ...]:
+    return tuple(normalize_text(text or "").split())
 
 
-def _parsed_field(parsed, field_name: str):
-    if parsed is None:
-        return None, None
-    if isinstance(parsed, dict):
-        value = parsed.get(field_name)
-    else:
-        value = getattr(parsed, field_name, None)
+def _normalize_level(value) -> str:
     if value is None:
-        return None, None
-    if isinstance(value, str):
-        return value, None
-    inner = getattr(value, "value", None)
-    span = getattr(value, "raw_span", None) or getattr(value, "evidence", None)
-    return inner, span
+        return ""
+    v = normalize_text(str(value).strip())
+    if v in ("province", "tinh", "thanh pho", "tp", "1"):
+        return "province"
+    if v in ("district", "huyen", "quan", "thi xa", "tx", "2"):
+        return "district"
+    if v in ("ward", "xa", "phuong", "thi tran", "tt", "3"):
+        return "ward"
+    return v
+
+
+def _entry_to_tuple(entry) -> tuple[str, ...]:
+    if entry is None:
+        return ()
+    if isinstance(entry, str):
+        return _norm_tuple(entry)
+    name = getattr(entry, "normalized_name", None) or getattr(entry, "name", None)
+    if name:
+        return _norm_tuple(str(name))
+    return _norm_tuple(str(entry))
+
+
+def _to_known_set(entries) -> set[tuple[str, ...]]:
+    if entries is None:
+        return set()
+    if isinstance(entries, str):
+        return {_norm_tuple(entries)} if _norm_tuple(entries) else set()
+    if hasattr(entries, "units"):
+        # AdminIndex-like: lấy tên theo level ở hàm _known_from_index.
+        return set()
+    if isinstance(entries, dict):
+        entries = list(entries.values())
+    out: set[tuple[str, ...]] = set()
+    try:
+        iterator = iter(entries)
+    except TypeError:
+        return {_norm_tuple(str(entries))} if _norm_tuple(str(entries)) else set()
+    for entry in iterator:
+        tup = _entry_to_tuple(entry)
+        if tup:
+            out.add(tup)
+    return out
+
+
+def _known_from_index(index):
+    provinces, districts, wards = set(), set(), set()
+    units = getattr(index, "units", None)
+    if isinstance(units, dict):
+        units = list(units.values())
+    elif isinstance(units, (list, tuple, set)):
+        units = list(units)
+    else:
+        return provinces, districts, wards
+    for unit in units:
+        if isinstance(unit, dict):
+            level = _normalize_level(unit.get("level") or unit.get("type") or "")
+            name = unit.get("normalized_name") or unit.get("name") or ""
+        else:
+            level = _normalize_level(getattr(unit, "level", "") or getattr(unit, "type", "") or "")
+            name = getattr(unit, "normalized_name", None) or getattr(unit, "name", "") or ""
+        tup = _norm_tuple(str(name))
+        if not tup:
+            continue
+        if level == "province":
+            provinces.add(tup)
+        elif level == "district":
+            districts.add(tup)
+        elif level == "ward":
+            wards.add(tup)
+    return provinces, districts, wards
+
+
+def _contains_subsequence(tokens: tuple[str, ...], sub: tuple[str, ...]) -> bool:
+    if not sub or len(sub) > len(tokens):
+        return False
+    return any(tokens[i:i + len(sub)] == sub for i in range(len(tokens) - len(sub) + 1))
+
+
+def _segment_admin_tokens(segment: str) -> tuple[str, ...]:
+    """Token hành chính của một đoạn: bỏ toàn bộ đoạn nhà/đường.
+
+    "đường Lam Sơn" -> () (đây là tên đường, không phải xã "Lam Sơn").
+    "Số 12" -> () (đây là số nhà). Các đoạn còn lại giữ nguyên token.
+    """
+    tokens = tuple(normalize_text(segment or "").split())
+    if not tokens:
+        return ()
+    if tokens[0] in _STREET_PREFIXES:
+        return ()
+    if tokens[0] in _HOUSE_PREFIXES:
+        return ()
+    if tokens[0].isdigit():
+        # "127 Nguyễn Trãi": số nhà + tên đường, không có cấp hành chính.
+        return ()
+    return tokens
+
+
+def _admin_segments(raw: str) -> list[tuple[str, ...]]:
+    return [_segment_admin_tokens(seg) for seg in (raw or "").split(",")]
+
+
+def _detect_levels_by_name(raw: str, known_provinces, known_districts, known_wards) -> set[str]:
+    levels: set[str] = set()
+    if not (known_provinces or known_districts or known_wards):
+        return levels
+    for admin_tokens in _admin_segments(raw):
+        if not admin_tokens:
+            continue
+        for level, known in (
+            ("province", known_provinces),
+            ("district", known_districts),
+            ("ward", known_wards),
+        ):
+            if not known:
+                continue
+            for length in sorted({len(k) for k in known}, reverse=True):
+                if length > len(admin_tokens):
+                    continue
+                if any(admin_tokens[i:i + length] in known
+                       for i in range(len(admin_tokens) - length + 1)):
+                    levels.add(level)
+                    break
+    return levels
+
+
+def _detect_levels_by_prefix(raw: str) -> set[str]:
+    levels: set[str] = set()
+    for segment in (raw or "").split(","):
+        tokens = tuple(normalize_text(segment or "").split())
+        if not tokens:
+            continue
+        for prefix, level in _PREFIX_LEVELS.items():
+            if tokens[:len(prefix)] == prefix:
+                levels.add(level)
+                break
+    return levels
+
+
+def _get_parsed_field(parsed, names):
+    if parsed is None:
+        return None
+    if isinstance(parsed, dict):
+        for name in names:
+            value = parsed.get(name)
+            if value not in (None, ""):
+                return value
+        admin_levels = parsed.get("admin_levels")
+        if isinstance(admin_levels, dict):
+            for name in names:
+                value = admin_levels.get(name)
+                if value not in (None, ""):
+                    return value
+        return None
+    for name in names:
+        value = getattr(parsed, name, None)
+        if value not in (None, ""):
+            return value
+    admin_levels = getattr(parsed, "admin_levels", None)
+    if isinstance(admin_levels, dict):
+        for name in names:
+            value = admin_levels.get(name)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _levels_from_parsed(parsed, admin_segments: list[tuple[str, ...]],
+                        known_provinces, known_districts, known_wards) -> set[str]:
+    """Cấp từ parsed, chỉ khi có bằng chứng trong ĐOẠN HÀNH CHÍNH của raw.
+
+    Tên parser đoán ra nhưng khách không viết thì không được tính, và
+    tên chỉ nằm trong đoạn đường thì cũng không được tính: ví dụ parsed
+    ward="Phú Cường" trong khi raw chỉ có "bi" -> không tính; parsed
+    district/tỉnh suy từ "Lam Sơn" trong khi raw chỉ có
+    "Sói 799, đường Lam Sơn" -> không tính (tên "Lam Sơn" chỉ nằm trong
+    đoạn đường, đã bị bỏ khỏi admin_segments).
+    """
+    if parsed is None:
+        return set()
+    levels: set[str] = set()
+    fields = (
+        ("province", ("province_name", "province", "province_text")),
+        ("district", ("district_name", "district", "district_text")),
+        ("ward", ("ward_name", "ward", "ward_text")),
+    )
+    known_by_level = {
+        "province": known_provinces,
+        "district": known_districts,
+        "ward": known_wards,
+    }
+    for level, names in fields:
+        value = _get_parsed_field(parsed, names)
+        if not value:
+            continue
+        name_tuple = _norm_tuple(str(value))
+        if not name_tuple:
+            continue
+        # (b) khớp đúng tên của chính cấp đó, khi có bảng known.
+        known = known_by_level[level]
+        if known and name_tuple not in known:
+            continue
+        # (a) tên phải xuất hiện trong một đoạn hành chính của raw_input
+        # như dãy token liên tiếp.
+        if not any(_contains_subsequence(seg_tokens, name_tuple) for seg_tokens in admin_segments):
+            continue
+        levels.add(level)
+    return levels
 
 
 class InputGuard:
-    def __init__(self, known_provinces=None, known_districts=None,
-                 known_wards=None, **_ignored):
-        raw_known = {
-            "province": [_extract_name(n) for n in (known_provinces or [])],
-            "district": [_extract_name(n) for n in (known_districts or [])],
-            "ward": [_extract_name(n) for n in (known_wards or [])],
-        }
-        # Mỗi tên chuẩn -> tập biến thể để khớp: dạng gốc, bỏ tiền tố,
-        # và cả hai dạng sau khi bỏ dấu.
-        self._variants: dict[str, list[set]] = {}
-        for level, names in raw_known.items():
-            variants = []
-            for name in names:
-                if not name:
-                    continue
-                forms = {_norm(name), _strip_prefix(_norm(name)),
-                         _plain(name), _strip_prefix(_plain(name))}
-                variants.append({f for f in forms if f})
-            self._variants[level] = variants
+    """Chặn input thiếu cấp / mơ hồ trước khi vào pipeline, fail-closed."""
 
-    # -- phân đoạn ---------------------------------------------------------- #
-    @staticmethod
-    def _segment_variants(raw_norm: str, raw_plain: str) -> list:
-        """Trả list cặp (norm, plain) cho từng đoạn, đã loại đoạn tên đường."""
-        norm_segments = [s.strip() for s in re.split(r"[,;]", raw_norm) if s.strip()]
-        plain_segments = [s.strip() for s in re.split(r"[,;]", raw_plain) if s.strip()]
-        pairs = list(zip(norm_segments, plain_segments))
-        return [pair for pair in pairs
-                if not _STREET_HINT.search(pair[0])
-                and not _STREET_HINT.search(pair[1])]
+    def __init__(self, known_provinces=None, known_districts=None, known_wards=None,
+                 *args, **kwargs) -> None:
+        if known_provinces is None:
+            known_provinces = (kwargs.pop("provinces", None)
+                               or kwargs.pop("province_names", None))
+        if known_districts is None:
+            known_districts = (kwargs.pop("districts", None)
+                               or kwargs.pop("district_names", None))
+        if known_wards is None:
+            known_wards = (kwargs.pop("wards", None)
+                           or kwargs.pop("ward_names", None))
+        known_names = kwargs.pop("known_names", None)
+        if isinstance(known_names, dict):
+            known_provinces = known_provinces or known_names.get("province") or known_names.get("provinces")
+            known_districts = known_districts or known_names.get("district") or known_names.get("districts")
+            known_wards = known_wards or known_names.get("ward") or known_names.get("wards")
+        positional = list(args)
+        if positional:
+            first = positional[0]
+            if hasattr(first, "units"):
+                provinces, districts, wards = _known_from_index(first)
+                known_provinces = known_provinces or provinces
+                known_districts = known_districts or districts
+                known_wards = known_wards or wards
+                positional = positional[1:]
+            elif isinstance(first, dict):
+                known_provinces = known_provinces or first.get("province") or first.get("provinces")
+                known_districts = known_districts or first.get("district") or first.get("districts")
+                known_wards = known_wards or first.get("ward") or first.get("wards")
+                positional = positional[1:]
+        if positional:
+            if len(positional) >= 1 and known_provinces is None:
+                known_provinces = positional[0]
+            if len(positional) >= 2 and known_districts is None:
+                known_districts = positional[1]
+            if len(positional) >= 3 and known_wards is None:
+                known_wards = positional[2]
+        # Trường hợp gọi InputGuard(admin_index) ở vị trí đầu tiên.
+        if known_provinces is not None and hasattr(known_provinces, "units"):
+            provinces, districts, wards = _known_from_index(known_provinces)
+            known_provinces, known_districts, known_wards = provinces, districts, wards
+        index = kwargs.pop("admin_index", None) or kwargs.pop("index", None)
+        if index is not None and not (known_provinces or known_districts or known_wards):
+            provinces, districts, wards = _known_from_index(index)
+            known_provinces = known_provinces or provinces
+            known_districts = known_districts or districts
+            known_wards = known_wards or wards
+        self.known_provinces = _to_known_set(known_provinces)
+        self.known_districts = _to_known_set(known_districts)
+        self.known_wards = _to_known_set(known_wards)
 
-    # -- đếm cấp từ raw ------------------------------------------------------ #
-    def _levels_from_raw(self, raw_norm: str, raw_plain: str) -> dict:
-        found: dict[str, str] = {}
-        pairs = self._segment_variants(raw_norm, raw_plain)
-        segment_variants = [[n, p] for n, p in pairs]
-        for level in ("province", "district", "ward"):
-            for variants in self._variants[level]:
-                flat = [seg for pair in segment_variants for seg in pair]
-                if _found_in(variants, flat):
-                    found[level] = sorted(variants)[0]
-                    break
-        for norm_seg, plain_seg in pairs:
-            for level, pattern in _PREFIX_LEVELS:
-                if level not in found and (pattern.match(norm_seg)
-                                           or pattern.match(plain_seg)):
-                    found[level] = norm_seg
-                    break
-            if "district" not in found and (
-                    norm_seg.startswith("thành phố ")
-                    or plain_seg.startswith("thanh pho ")):
-                city = norm_seg[len("thành phố "):].strip()
-                province_hit = any(
-                    _found_in(variants, [city, _plain(city)])
-                    for variants in self._variants["province"])
-                if province_hit:
-                    found.setdefault("province", norm_seg)
-                else:
-                    found["district"] = norm_seg
-        return found
-
-    # -- đếm cấp từ parsed, chỉ khi có bằng chứng raw ------------------------ #
-    def _levels_from_parsed(self, parsed, raw_norm: str, raw_plain: str,
-                            already: dict) -> dict:
-        found = dict(already)
-        pairs = self._segment_variants(raw_norm, raw_plain)
-        flat = [seg for pair in pairs for seg in pair]
-        for level in ("province", "district", "ward"):
-            if level in found:
-                continue
-            value, span = _parsed_field(parsed, level)
-            if not value:
-                continue
-            value_norm = _norm(str(value))
-            variants = {value_norm, _strip_prefix(value_norm),
-                        _plain(str(value)), _strip_prefix(_plain(str(value)))}
-            evidence_ok = False
-            if span and (_norm(str(span)) in raw_norm
-                         or _plain(str(span)) in raw_plain):
-                evidence_ok = True
-            elif _found_in({v for v in variants if v}, flat):
-                evidence_ok = True
-            if evidence_ok:
-                found[level] = str(value)
-        return found
-
-    # -- API chính ------------------------------------------------------------ #
-    def check(self, raw_input, parsed=None, **kwargs) -> GuardResult:
-        if parsed is None and "parsed_address" in kwargs:
-            parsed = kwargs["parsed_address"]
-        raw = raw_input if isinstance(raw_input, str) else str(raw_input or "")
-        raw_norm = _norm(raw)
-        raw_plain = _plain(raw)
-        if not raw_norm:
-            return GuardResult(GuardDecision.REJECTED,
-                               ReasonStr("INSUFFICIENT_INFO"), (), {}, raw)
-        if _NUMBER_ONLY.match(raw_norm):
-            return GuardResult(GuardDecision.REJECTED,
-                               ReasonStr("NUMBER_ONLY"), (), {}, raw)
-        matched = self._levels_from_raw(raw_norm, raw_plain)
-        if parsed is not None:
-            matched = self._levels_from_parsed(parsed, raw_norm, raw_plain, matched)
-        levels = tuple(
-            level for level in ("province", "district", "ward") if level in matched)
-        if len(levels) >= 2:
-            return GuardResult(GuardDecision.PASS, ReasonStr("OK"),
-                               levels, matched, raw)
-        if len(levels) == 1:
-            return GuardResult(GuardDecision.NEED_CLARIFICATION,
-                               ReasonStr("MISSING_ADMIN_LEVELS"),
-                               levels, matched, raw)
-        tokens = [t for t in re.split(r"\s+", raw_norm) if t]
-        reason = "TOO_SHORT" if len(tokens) <= 2 and len(raw_norm) < 12 \
-            else "INSUFFICIENT_INFO"
-        return GuardResult(GuardDecision.REJECTED, ReasonStr(reason),
-                           (), matched, raw)
-
-    def evaluate(self, raw_input, parsed=None, **kwargs) -> GuardResult:
-        return self.check(raw_input, parsed=parsed, **kwargs)
+    def check(self, raw=None, parsed=None, *args, **kwargs) -> GuardResult:
+        # AddressService gọi check(raw_input, parsed); cũng chấp nhận
+        # check(raw_input="...", parsed_address=...) hoặc check(parsed) đơn.
+        if raw is None:
+            raw = kwargs.get("raw_input") or kwargs.get("raw") or kwargs.get("text") or ""
+        if isinstance(raw, dict):
+            parsed = parsed or raw.get("parsed")
+            raw = raw.get("raw_input") or raw.get("raw") or raw.get("text") or ""
+        if parsed is None:
+            parsed = kwargs.get("parsed") or kwargs.get("parsed_address") or kwargs.get("address")
+        if parsed is None and args:
+            parsed = args[0]
+        raw_str = raw if isinstance(raw, str) else (str(raw) if raw is not None else "")
+        norm = normalize_text(raw_str)
+        if not norm:
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, ReasonCode.INSUFFICIENT_INPUT,
+                               "Input rỗng hoặc không đọc được.")
+        if norm.replace(" ", "").isdigit():
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, ReasonCode.NUMBER_ONLY,
+                               "Chỉ có số, không có cấp hành chính.")
+        if norm in _AMBIGUOUS_TOKENS:
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, ReasonCode.GENERIC_TOKEN_ONLY,
+                               "Token đơn mơ hồ, không đủ bằng chứng địa chỉ.")
+        if len(norm) <= 3:
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, ReasonCode.INPUT_TOO_SHORT,
+                               "Input quá ngắn.")
+        admin_segments = _admin_segments(raw_str)
+        levels = set()
+        levels |= _detect_levels_by_name(raw_str, self.known_provinces,
+                                         self.known_districts, self.known_wards)
+        levels |= _detect_levels_by_prefix(raw_str)
+        levels |= _levels_from_parsed(parsed, admin_segments, self.known_provinces,
+                                      self.known_districts, self.known_wards)
+        if len(levels) < 2:
+            if "province" not in levels:
+                code = ReasonCode.MISSING_PROVINCE
+            elif "district" not in levels:
+                code = ReasonCode.MISSING_DISTRICT
+            else:
+                code = ReasonCode.MISSING_WARD
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, code,
+                               f"Thiếu cấp hành chính, chỉ xác định được: {sorted(levels)}.")
+        return GuardResult(GuardDecision.PASS, ReasonCode.OK, "Đủ cấp hành chính.")

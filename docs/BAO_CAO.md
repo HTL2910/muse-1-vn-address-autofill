@@ -1,6 +1,6 @@
 # Báo Cáo Nghiên Cứu & Giải Pháp Hội Đồng Chuyên Gia (MuseAssistantTeam)
 
-- **GitHub Repository:** https://github.com/HTL2910/muse-1-toi-co-mot-bai-toan-nhu-nay-mot-cua-hang
+- **GitHub Repository:** https://github.com/HTL2910/muse-1-vn-address-autofill
 - **Trưởng nhóm điều phối:** muse (CEO)
 - **Số chuyên gia tham gia:** 5 thành viên
 - **Số nhánh sửa lỗi (`fix/...`) đã kiểm thử & gộp:** 16 nhánh
@@ -11,7 +11,7 @@
 # Hệ thống Autofill Địa chỉ Việt Nam — Fail-Closed Address Intelligence
 
 > **Trạng thái: 100% ĐỒNG THUẬN sau 2 vòng kiểm định trên `main`**
-> **Repository:** https://github.com/HTL2910/muse-1-toi-co-mot-bai-toan-nhu-nay-mot-cua-hang
+> **Repository:** https://github.com/HTL2910/muse-1-vn-address-autofill
 > **Hội đồng:** MuseAssistantTeam — muse (CEO / Team Lead), systems-arch, algo-ml, backend-sec, fullstack-ux
 
 ---
@@ -321,8 +321,8 @@ Cộng thêm ca hợp lệ đối chứng. Toàn bộ test suite gồm golden re
 ### 5.2. Cài đặt
 
 ```bash
-git clone https://github.com/HTL2910/muse-1-toi-co-mot-bai-toan-nhu-nay-mot-cua-hang
-cd muse-1-toi-co-mot-bai-toan-nhu-nay-mot-cua-hang
+git clone https://github.com/HTL2910/muse-1-vn-address-autofill
+cd muse-1-vn-address-autofill
 
 python -m venv .venv
 source .venv/bin/activate
