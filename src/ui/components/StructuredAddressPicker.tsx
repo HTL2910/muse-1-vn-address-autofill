@@ -1,391 +1,358 @@
 /**
- * Structured Address Picker 3 cấp — approach_13, nhánh expert/systems-arch-m1.
+ * StructuredAddressPicker — fix_picker_suggestion_bypasses_hierarchy.
  *
- * Thay ô địa chỉ tự do duy nhất bằng flow:
- *   Tỉnh/Thành -> Quận/Huyện -> Phường/Xã -> số nhà / đường / thôn-xóm
- * Mỗi bước lọc theo mã hành chính cha (không tìm toàn quốc).
- * Ô tìm kiếm nhanh (Goong) chỉ gợi ý sau >= 3 ký tự có nghĩa,
- * debounce 300ms, tối đa 5 gợi ý kèm đầy đủ tỉnh/huyện/xã.
- * Backend chỉ nhận khi có đủ province_code, district_code, ward_code.
+ * Quy tắc bắt buộc:
+ * 1) Mọi gợi ý (Goong / provider bất kỳ) chỉ là ĐỀ XUẤT. Trước khi nhận phải
+ *    qua validateSuggestionHierarchy + hasValidCodes:
+ *    - đủ 3 mã tỉnh/huyện/xã,
+ *    - huyện thuộc tỉnh, xã thuộc huyện (theo parent_code tường minh nếu
+ *      provider trả kèm, nếu không theo quy ước tiền tố mã phân cấp),
+ *    - nếu tỉnh đã được neo/khóa (anchoredProvinceCode hoặc tỉnh khách đã
+ *      chọn tay) thì gợi ý lệch tỉnh bị loại 100%.
+ *    Gợi ý xung đột -> KHÔNG gán mã nào vào form, hiển thị lỗi, giữ nguyên
+ *    địa chỉ khách đang nhập.
+ * 2) Trạng thái luôn được tính lại từ form MỚI bằng deriveStatus trong mọi
+ *    lần thay đổi (kể cả sửa ô chi tiết sau khi đã chọn gợi ý). Không bao
+ *    giờ mang status cũ (đặc biệt VERIFIED) sang form đã sửa.
+ * 3) Chỉ cho submit khi hasValidCodes(form) == true.
+ *
+ * Lưu ý: kiểm tra ở UI là phòng thủ phụ — backend (province anchor +
+ * validator) vẫn là chốt chặn chính, picker không tự coi gợi ý là đúng.
  */
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useMemo, useState } from "react";
 
-export interface AdminUnit {
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface AdminOption {
   code: string;
   name: string;
-  level: "province" | "district" | "ward";
+  /** Mã cấp cha tường minh, nếu dữ liệu/provider có. */
   parent_code?: string | null;
 }
 
-export interface AddressValue {
-  raw_input: string;
-  province: string;
-  province_code: string;
-  district: string;
-  district_code: string;
-  ward: string;
-  ward_code: string;
-  street: string;
-  house_number: string;
-  hamlet: string;
-}
-
-export type GateStatus = "VERIFIED" | "NEED_CONFIRMATION" | "REJECTED_INSUFFICIENT";
-
 export interface Suggestion {
-  display: string;
-  province: string;
+  label: string;
   province_code: string;
-  district: string;
   district_code: string;
-  ward: string;
   ward_code: string;
-  street?: string;
-  house_number?: string;
-  confidence: number;
-  source: string;
+  province_name?: string;
+  district_name?: string;
+  ward_name?: string;
+  /** parent_code tường minh do provider trả kèm (nếu có). */
+  district_province_code?: string | null;
+  ward_district_code?: string | null;
 }
 
-interface Props {
-  customerId?: string;
-  value?: Partial<AddressValue>;
-  onChange: (value: AddressValue, status: GateStatus) => void;
-  onStatusChange?: (status: GateStatus, reason?: string) => void;
-  disabled?: boolean;
+export type PickerStatus =
+  | "INCOMPLETE"
+  | "NEEDS_CONFIRMATION"
+  | "VERIFIED";
+
+export interface AddressForm {
+  province_code: string;
+  district_code: string;
+  ward_code: string;
+  province_name: string;
+  district_name: string;
+  ward_name: string;
+  house_number: string;
+  street: string;
+  detail: string;
+  status: PickerStatus;
 }
 
-const EMPTY: AddressValue = {
-  raw_input: "",
-  province: "",
-  province_code: "",
-  district: "",
-  district_code: "",
-  ward: "",
-  ward_code: "",
-  street: "",
-  house_number: "",
-  hamlet: "",
+export interface HierarchyCheck {
+  ok: boolean;
+  reason:
+    | "OK"
+    | "MISSING_CODES"
+    | "DISTRICT_NOT_IN_PROVINCE"
+    | "WARD_NOT_IN_DISTRICT"
+    | "PROVINCE_ANCHOR_MISMATCH";
+  message: string;
+}
+
+// ---------------------------------------------------------------------------
+// Kiểm tra phân cấp thuần (export để test và tái sử dụng)
+// ---------------------------------------------------------------------------
+
+function belongsTo(childCode: string, parentCode: string,
+                   explicitParentCode?: string | null): boolean {
+  if (!childCode || !parentCode) return false;
+  if (explicitParentCode != null && explicitParentCode !== "") {
+    return String(explicitParentCode) === String(parentCode);
+  }
+  // Quy ước mã phân cấp dự phòng: mã cấp dưới bắt đầu bằng mã cấp trên.
+  return String(childCode).startsWith(String(parentCode));
+}
+
+export function hasValidCodes(input: {
+  province_code?: string | null;
+  district_code?: string | null;
+  ward_code?: string | null;
+  district_province_code?: string | null;
+  ward_district_code?: string | null;
+}): boolean {
+  const { province_code, district_code, ward_code } = input;
+  if (!province_code || !district_code || !ward_code) return false;
+  if (!belongsTo(district_code, province_code, input.district_province_code)) {
+    return false;
+  }
+  if (!belongsTo(ward_code, district_code, input.ward_district_code)) {
+    return false;
+  }
+  return true;
+}
+
+export function validateSuggestionHierarchy(
+  suggestion: Suggestion,
+  opts: { anchoredProvinceCode?: string | null } = {},
+): HierarchyCheck {
+  if (!suggestion.province_code || !suggestion.district_code || !suggestion.ward_code) {
+    return {
+      ok: false, reason: "MISSING_CODES",
+      message: "Gợi ý thiếu mã tỉnh/huyện/xã nên không được áp dụng.",
+    };
+  }
+  if (opts.anchoredProvinceCode &&
+      String(suggestion.province_code) !== String(opts.anchoredProvinceCode)) {
+    return {
+      ok: false, reason: "PROVINCE_ANCHOR_MISMATCH",
+      message: "Gợi ý nằm ngoài tỉnh bạn đã chọn nên đã bị loại.",
+    };
+  }
+  if (!belongsTo(suggestion.district_code, suggestion.province_code,
+                 suggestion.district_province_code)) {
+    return {
+      ok: false, reason: "DISTRICT_NOT_IN_PROVINCE",
+      message: "Gợi ý có huyện không thuộc tỉnh tương ứng nên đã bị loại.",
+    };
+  }
+  if (!belongsTo(suggestion.ward_code, suggestion.district_code,
+                 suggestion.ward_district_code)) {
+    return {
+      ok: false, reason: "WARD_NOT_IN_DISTRICT",
+      message: "Gợi ý có xã/phường không thuộc huyện tương ứng nên đã bị loại.",
+    };
+  }
+  return { ok: true, reason: "OK", message: "" };
+}
+
+/**
+ * Trạng thái LUÔN suy ra từ form được truyền vào — không đọc state cũ.
+ * VERIFIED không bao giờ tự sinh ở UI sau khi form thay đổi: sau mọi lần
+ * sửa, form hoàn chỉnh chỉ ở NEEDS_CONFIRMATION cho tới khi backend xác
+ * nhận (bản ghi VERIFIED thuộc về kết quả của Address Gateway).
+ */
+export function deriveStatus(form: Omit<AddressForm, "status">): PickerStatus {
+  if (!hasValidCodes(form)) return "INCOMPLETE";
+  return "NEEDS_CONFIRMATION";
+}
+
+const EMPTY_FORM: AddressForm = {
+  province_code: "", district_code: "", ward_code: "",
+  province_name: "", district_name: "", ward_name: "",
+  house_number: "", street: "", detail: "",
+  status: "INCOMPLETE",
 };
 
-function meaningfulLength(text: string): number {
-  // Đếm ký tự có nghĩa, bỏ khoảng trắng và từ chung 1-2 ký tự.
-  return text.replace(/\s+/g, "").replace(/^(xom|bi)$/i, "").length;
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
+export interface StructuredAddressPickerProps {
+  provinces: AdminOption[];
+  districts: AdminOption[];
+  wards: AdminOption[];
+  initialValue?: Partial<AddressForm>;
+  /** Tỉnh đã neo từ bước trước (vd khách đã khai báo tỉnh): khóa gợi ý. */
+  anchoredProvinceCode?: string | null;
+  fetchSuggestions?: (query: string) => Promise<Suggestion[]>;
+  onChange?: (form: AddressForm) => void;
+  onSubmit?: (form: AddressForm) => void;
 }
 
-function useDebounced<T>(value: T, delayMs: number): T {
-  const [debounced, setDebounced] = useState(value);
-  useEffect(() => {
-    const t = setTimeout(() => setDebounced(value), delayMs);
-    return () => clearTimeout(t);
-  }, [value, delayMs]);
-  return debounced;
-}
-
-async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
-  if (!res.ok) throw new Error(`Request failed: ${res.status} ${url}`);
-  return res.json() as Promise<T>;
-}
-
-export default function StructuredAddressPicker({
-  customerId,
-  value,
-  onChange,
-  onStatusChange,
-  disabled = false,
-}: Props) {
-  const [form, setForm] = useState<AddressValue>({ ...EMPTY, ...value });
-  const [provinces, setProvinces] = useState<AdminUnit[]>([]);
-  const [districts, setDistricts] = useState<AdminUnit[]>([]);
-  const [wards, setWards] = useState<AdminUnit[]>([]);
-  const [search, setSearch] = useState("");
+export function StructuredAddressPicker(props: StructuredAddressPickerProps) {
+  const { provinces, districts, wards, onChange, onSubmit } = props;
+  const [form, setFormState] = useState<AddressForm>({
+    ...EMPTY_FORM, ...(props.initialValue ?? {}),
+  });
+  const [query, setQuery] = useState("");
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
-  const [history, setHistory] = useState<AddressValue[]>([]);
-  const [status, setStatus] = useState<GateStatus>("NEED_CONFIRMATION");
   const [error, setError] = useState<string>("");
-  const [loading, setLoading] = useState(false);
-  const [highlight, setHighlight] = useState<Set<string>>(new Set());
-  const abortRef = useRef<AbortController | null>(null);
 
-  const debouncedSearch = useDebounced(search, 300);
+  const emit = (next: AddressForm) => {
+    setFormState(next);
+    onChange?.(next);
+  };
 
-  const isComplete = useMemo(
-    () =>
-      Boolean(form.province_code && form.district_code && form.ward_code),
-    [form]
-  );
+  const districtOptions = useMemo(
+    () => districts.filter(
+      (d) => !form.province_code || belongsTo(d.code, form.province_code, d.parent_code)),
+    [districts, form.province_code]);
+  const wardOptions = useMemo(
+    () => wards.filter(
+      (w) => !form.district_code || belongsTo(w.code, form.district_code, w.parent_code)),
+    [wards, form.district_code]);
 
-  const emit = useCallback(
-    (next: AddressValue, nextStatus: GateStatus, reason?: string) => {
-      setForm(next);
-      setStatus(nextStatus);
-      onChange(next, nextStatus);
-      onStatusChange?.(nextStatus, reason);
-    },
-    [onChange, onStatusChange]
-  );
-
-  // 1) Nạp master data tỉnh — nguồn sự thật nội bộ, không gọi Goong ở đây.
-  useEffect(() => {
-    fetchJson<AdminUnit[]>("/api/address/admin/provinces")
-      .then(setProvinces)
-      .catch(() => setError("Không tải được danh sách tỉnh/thành."));
-  }, []);
-
-  // 2) Lịch sử địa chỉ đã xác minh của khách — ưu tiên gợi ý.
-  useEffect(() => {
-    if (!customerId) return;
-    fetchJson<AddressValue[]>(
-      `/api/address/history?customer_id=${encodeURIComponent(customerId)}`
-    )
-      .then(setHistory)
-      .catch(() => undefined);
-  }, [customerId]);
-
-  // 3) Chọn tỉnh -> nạp huyện con của tỉnh đó.
-  useEffect(() => {
-    if (!form.province_code) {
-      setDistricts([]);
-      setWards([]);
-      return;
-    }
-    fetchJson<AdminUnit[]>(
-      `/api/address/admin/districts?province_code=${form.province_code}`
-    )
-      .then(setDistricts)
-      .catch(() => setError("Không tải được danh sách quận/huyện."));
-    setWards([]);
-  }, [form.province_code]);
-
-  // 4) Chọn huyện -> nạp xã con của huyện đó.
-  useEffect(() => {
-    if (!form.district_code) {
-      setWards([]);
-      return;
-    }
-    fetchJson<AdminUnit[]>(
-      `/api/address/admin/wards?district_code=${form.district_code}`
-    )
-      .then(setWards)
-      .catch(() => setError("Không tải được danh sách phường/xã."));
-  }, [form.district_code]);
-
-  // 5) Tìm kiếm nhanh Goong: >= 3 ký tự có nghĩa, debounce 300ms, tối đa 5.
-  useEffect(() => {
-    if (meaningfulLength(debouncedSearch) < 3) {
+  const search = async (text: string) => {
+    setQuery(text);
+    if (!props.fetchSuggestions || text.trim().length < 3) {
       setSuggestions([]);
       return;
     }
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setLoading(true);
-    fetch(
-      `/api/address/suggest?q=${encodeURIComponent(debouncedSearch)}&limit=5`,
-      { signal: controller.signal }
-    )
-      .then((r) => r.json())
-      .then((data: { suggestions: Suggestion[] }) => {
-        // Ưu tiên lịch sử đã xác minh của khách lên đầu.
-        const mine = history
-          .filter((h) => h.raw_input.toLowerCase().includes(debouncedSearch.toLowerCase()))
-          .slice(0, 2)
-          .map((h) => ({
-            display: h.raw_input,
-            province: h.province,
-            province_code: h.province_code,
-            district: h.district,
-            district_code: h.district_code,
-            ward: h.ward,
-            ward_code: h.ward_code,
-            street: h.street,
-            house_number: h.house_number,
-            confidence: 1,
-            source: "customer_confirmed",
-          }));
-        setSuggestions([...mine, ...(data.suggestions ?? [])].slice(0, 5));
-      })
-      .catch((e: unknown) => {
-        if ((e as Error).name !== "AbortError") setSuggestions([]);
-      })
-      .finally(() => setLoading(false));
-    return () => controller.abort();
-  }, [debouncedSearch, history]);
+    const results = await props.fetchSuggestions(text);
+    // Lọc ngay từ danh sách hiển thị: gợi ý vi phạm phân cấp / lệch tỉnh
+    // neo không được hiện cho khách bấm vào.
+    setSuggestions(results.filter(
+      (s) => validateSuggestionHierarchy(s, {
+        anchoredProvinceCode: props.anchoredProvinceCode ?? form.province_code || null,
+      }).ok));
+  };
 
-  const pickSuggestion = (s: Suggestion) => {
-    const next: AddressValue = {
+  const pickSuggestion = (suggestion: Suggestion): boolean => {
+    const check = validateSuggestionHierarchy(suggestion, {
+      anchoredProvinceCode: props.anchoredProvinceCode ?? form.province_code || null,
+    });
+    if (!check.ok || !hasValidCodes(suggestion)) {
+      // Loại gợi ý: không gán bất kỳ mã nào, giữ nguyên form hiện tại.
+      setError(check.message || "Gợi ý không hợp lệ về phân cấp nên đã bị loại.");
+      return false;
+    }
+    setError("");
+    const base = {
       ...form,
-      raw_input: s.display,
-      province: s.province,
-      province_code: s.province_code,
-      district: s.district,
-      district_code: s.district_code,
-      ward: s.ward,
-      ward_code: s.ward_code,
-      street: s.street ?? form.street,
-      house_number: s.house_number ?? form.house_number,
+      province_code: suggestion.province_code,
+      district_code: suggestion.district_code,
+      ward_code: suggestion.ward_code,
+      province_name: suggestion.province_name ?? form.province_name,
+      district_name: suggestion.district_name ?? form.district_name,
+      ward_name: suggestion.ward_name ?? form.ward_name,
     };
-    // Highlight từng cấp để khách đối chiếu trước khi chốt.
-    setHighlight(new Set(["province", "district", "ward"]));
+    const nextForm: AddressForm = { ...base, status: deriveStatus(base) };
+    emit(nextForm);
     setSuggestions([]);
-    setSearch("");
-    emit(next, s.confidence >= 0.85 ? "VERIFIED" : "NEED_CONFIRMATION");
+    return true;
   };
 
-  const selectProvince = (code: string) => {
-    const unit = provinces.find((p) => p.code === code);
-    if (!unit) return;
-    emit(
-      { ...form, province: unit.name, province_code: code, district: "", district_code: "", ward: "", ward_code: "" },
-      "NEED_CONFIRMATION",
-      "province_changed"
-    );
+  const updateDetail = (patch: Partial<AddressForm>) => {
+    const base = { ...form, ...patch };
+    // Tính trạng thái từ form MỚI (base), tuyệt đối không giữ status cũ:
+    // sửa bất kỳ trường nào sau khi đã hoàn chỉnh đều hạ về
+    // NEEDS_CONFIRMATION/INCOMPLETE để backend xác nhận lại.
+    const nextForm: AddressForm = { ...base, status: deriveStatus(base) };
+    emit(nextForm);
   };
 
-  const selectDistrict = (code: string) => {
-    const unit = districts.find((d) => d.code === code);
-    if (!unit) return;
-    emit(
-      { ...form, district: unit.name, district_code: code, ward: "", ward_code: "" },
-      "NEED_CONFIRMATION",
-      "district_changed"
-    );
+  const pickProvince = (code: string) => {
+    const option = provinces.find((p) => p.code === code);
+    updateDetail({
+      province_code: code, province_name: option?.name ?? "",
+      district_code: "", district_name: "", ward_code: "", ward_name: "",
+    });
   };
 
-  const selectWard = (code: string) => {
-    const unit = wards.find((w) => w.code === code);
-    if (!unit) return;
-    const next = { ...form, ward: unit.name, ward_code: code };
-    emit(next, "NEED_CONFIRMATION", "ward_selected");
+  const pickDistrict = (code: string) => {
+    const option = districtOptions.find((d) => d.code === code);
+    if (option && form.province_code &&
+        !belongsTo(option.code, form.province_code, option.parent_code)) {
+      setError("Huyện đã chọn không thuộc tỉnh hiện tại.");
+      return;
+    }
+    setError("");
+    updateDetail({
+      district_code: code, district_name: option?.name ?? "",
+      ward_code: "", ward_name: "",
+    });
   };
 
-  const updateDetail = (patch: Partial<AddressValue>) => {
-    const next = { ...form, ...patch, raw_input: "" };
-    const raw = [next.house_number, next.street, next.hamlet, next.ward, next.district, next.province]
-      .filter(Boolean)
-      .join(", ");
-    next.raw_input = raw;
-    // Chưa đủ 3 mã thì không bao giờ VERIFIED.
-    const nextStatus: GateStatus =
-      next.province_code && next.district_code && next.ward_code
-        ? status
-        : "NEED_CONFIRMATION";
-    emit(next, nextStatus);
+  const pickWard = (code: string) => {
+    const option = wardOptions.find((w) => w.code === code);
+    if (option && form.district_code &&
+        !belongsTo(option.code, form.district_code, option.parent_code)) {
+      setError("Xã/phường đã chọn không thuộc huyện hiện tại.");
+      return;
+    }
+    setError("");
+    updateDetail({ ward_code: code, ward_name: option?.name ?? "" });
   };
 
-  const canSubmit = isComplete && form.street.trim().length >= 2;
+  const canSubmit = hasValidCodes(form);
 
   return (
-    <div aria-label="Chọn địa chỉ giao hàng">
-      <label>
-        Tìm nhanh địa chỉ (tối thiểu 3 ký tự)
-        <input
-          value={search}
-          disabled={disabled}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="VD: 127 Nguyễn Trãi, Cuôr Đăng, Đắk Lắk"
-          autoComplete="off"
-        />
-      </label>
-      {loading && <p>Đang gợi ý…</p>}
+    <div>
+      <input
+        aria-label="Tìm địa chỉ"
+        value={query}
+        onChange={(e) => void search(e.target.value)}
+        placeholder="Nhập địa chỉ để xem gợi ý"
+      />
       {suggestions.length > 0 && (
         <ul>
-          {suggestions.map((s, i) => (
-            <li key={`${s.ward_code}-${i}`}>
+          {suggestions.map((s) => (
+            <li key={`${s.ward_code}-${s.label}`}>
               <button type="button" onClick={() => pickSuggestion(s)}>
-                {s.display}
-                <small>
-                  {" "}
-                  — {s.ward}, {s.district}, {s.province} ({s.source})
-                </small>
+                {s.label}
               </button>
             </li>
           ))}
         </ul>
       )}
 
-      <label>
-        Tỉnh/Thành *
-        <select
-          value={form.province_code}
-          disabled={disabled}
-          onChange={(e) => selectProvince(e.target.value)}
-        >
-          <option value="">— Chọn tỉnh/thành —</option>
-          {provinces.map((p) => (
-            <option key={p.code} value={p.code}>{p.name}</option>
-          ))}
-        </select>
-      </label>
+      <select aria-label="Tỉnh/Thành phố" value={form.province_code}
+              onChange={(e) => pickProvince(e.target.value)}>
+        <option value="">Chọn tỉnh/thành phố</option>
+        {provinces.map((p) => (
+          <option key={p.code} value={p.code}>{p.name}</option>
+        ))}
+      </select>
 
-      <label>
-        Quận/Huyện *
-        <select
-          value={form.district_code}
-          disabled={disabled || !form.province_code}
-          onChange={(e) => selectDistrict(e.target.value)}
-        >
-          <option value="">— Chọn quận/huyện —</option>
-          {districts.map((d) => (
-            <option key={d.code} value={d.code}>{d.name}</option>
-          ))}
-        </select>
-      </label>
+      <select aria-label="Quận/Huyện" value={form.district_code}
+              onChange={(e) => pickDistrict(e.target.value)}>
+        <option value="">Chọn quận/huyện</option>
+        {districtOptions.map((d) => (
+          <option key={d.code} value={d.code}>{d.name}</option>
+        ))}
+      </select>
 
-      <label>
-        Phường/Xã *
-        <select
-          value={form.ward_code}
-          disabled={disabled || !form.district_code}
-          onChange={(e) => selectWard(e.target.value)}
-        >
-          <option value="">— Chọn phường/xã —</option>
-          {wards.map((w) => (
-            <option key={w.code} value={w.code}>{w.name}</option>
-          ))}
-        </select>
-      </label>
+      <select aria-label="Phường/Xã" value={form.ward_code}
+              onChange={(e) => pickWard(e.target.value)}>
+        <option value="">Chọn phường/xã</option>
+        {wardOptions.map((w) => (
+          <option key={w.code} value={w.code}>{w.name}</option>
+        ))}
+      </select>
 
-      <label>
-        Số nhà
-        <input
-          value={form.house_number}
-          disabled={disabled}
-          onChange={(e) => updateDetail({ house_number: e.target.value })}
-          placeholder="VD: 73, 127"
-        />
-      </label>
-      <label>
-        Đường *
-        <input
-          value={form.street}
-          disabled={disabled}
-          onChange={(e) => updateDetail({ street: e.target.value })}
-          placeholder="VD: đường Lam Sơn"
-        />
-      </label>
-      <label>
-        Thôn/Xóm
-        <input
-          value={form.hamlet}
-          disabled={disabled}
-          onChange={(e) => updateDetail({ hamlet: e.target.value })}
-          placeholder="VD: Xóm 5 (không bắt buộc)"
-        />
-      </label>
+      <input
+        aria-label="Số nhà"
+        value={form.house_number}
+        onChange={(e) => updateDetail({ house_number: e.target.value })}
+        placeholder="Số nhà"
+      />
+      <input
+        aria-label="Tên đường / thôn xóm"
+        value={form.street}
+        onChange={(e) => updateDetail({ street: e.target.value })}
+        placeholder="Tên đường, thôn/xóm"
+      />
+      <input
+        aria-label="Chi tiết bổ sung"
+        value={form.detail}
+        onChange={(e) => updateDetail({ detail: e.target.value })}
+        placeholder="Chi tiết bổ sung (không bắt buộc)"
+      />
 
-      {highlight.size > 0 && (
-        <p>
-          Đã bóc tách: Tỉnh <strong>{form.province}</strong> — Huyện{" "}
-          <strong>{form.district}</strong> — Xã <strong>{form.ward}</strong>.
-          Vui lòng đối chiếu trước khi xác nhận.
-        </p>
-      )}
-      {!canSubmit && (
-        <p>Chưa đủ thông tin: cần chọn đủ Tỉnh — Huyện — Xã và nhập tên đường.</p>
-      )}
       {error && <p role="alert">{error}</p>}
-      <p>Trạng thái: {status}</p>
+      <p data-testid="address-status">{form.status}</p>
+
+      <button type="button" disabled={!canSubmit}
+              onClick={() => canSubmit && onSubmit?.(form)}>
+        Xác nhận địa chỉ
+      </button>
     </div>
   );
 }
+
+export default StructuredAddressPicker;
