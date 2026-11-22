@@ -25,6 +25,13 @@ What this fix changes against the previous version:
    carrier and GPS are collected in one pass so CS can fix all fields
    at once.
 
+Fix cho golden_11 (bổ sung, giữ nguyên mọi logic trên): warning
+MISSING_HOUSE_OR_STREET chỉ cộng khi cả contract lẫn raw_input đều
+không có số nhà + tên đường. Địa chỉ đúng "Số 12, đường Lê Lợi, ..."
+không được bị trừ điểm chỉ vì một nguồn ứng viên (geocoder/fuzzy)
+làm rơi trường street/house_number khi tạo contract — bằng chứng
+nhà/đường nằm ngay trong raw_input khách viết.
+
 Fail-closed: any error -> BLOCKED, any warning or penalty ->
 NEEDS_REVIEW, only a fully clean address returns OK.
 Status: chua chay - ket qua do CI bao.
@@ -32,6 +39,7 @@ Status: chua chay - ket qua do CI bao.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional
@@ -79,6 +87,30 @@ def _result_field(obj: Any, *names: str):
         if value not in (None, ""):
             return value
     return None
+
+
+def _raw_has_house_or_street(raw_input: Optional[str]) -> bool:
+    """True khi raw_input tự nó chứa cả số nhà và tên đường.
+
+    Chỉ nhận khi cùng một đoạn có cả hai dấu hiệu: "Số 12, đường Lê Lợi"
+    hoặc "127 Nguyễn Trãi" (số ở đầu đoạn + ít nhất một từ tên đường).
+    "Số 12" đứng một mình, hay chỉ có tên đường không có số nhà, thì
+    không tính — để không che mất warning cho địa chỉ thiếu thật.
+    """
+    if not raw_input:
+        return False
+    for segment in str(raw_input).split(","):
+        seg = segment.strip()
+        if not seg:
+            continue
+        low = seg.lower()
+        if re.search(r"\b(?:đường|duong|ngõ|ngo|hẻm|hem)\b", low) and re.search(r"\d+", seg):
+            return True
+        if re.match(r"^\d+\s+\S+", seg):
+            return True
+        if re.search(r"\b(?:số|so)\s*\d+\b", low) and re.search(r"\b(?:đường|duong)\b", low):
+            return True
+    return False
 
 
 class HierarchicalValidator:
@@ -253,7 +285,7 @@ class HierarchicalValidator:
             if ward is not None and addr.district_code and ward.parent_code != addr.district_code:
                 errors.append(ValidationError("WARD_MISMATCH", "ward_code", "Ward not in district."))
 
-        if not addr.has_house_or_street:
+        if not addr.has_house_or_street and not _raw_has_house_or_street(addr.raw_input):
             warnings.append(ValidationError("MISSING_HOUSE_OR_STREET", "street", "Missing house/street."))
             penalty += 0.15
 

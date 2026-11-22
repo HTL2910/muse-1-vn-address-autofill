@@ -1,33 +1,36 @@
 """Fuzzy matcher — veto qua parent_code, fallback tra tên parse.
 
-Fix fix_fuzzy_exact_match_ignores_district (bản sửa lần 2):
-Exact-match phải qua cùng veto tỉnh và huyện như nhánh thường.
-
-Bài học từ lần test fail trước: KHÔNG kiểm tra `level == "ward"/"district"`.
-Đường mentions gốc không kiểm tra level, chỉ kiểm tra parent_code; validator
-cũng quy định hierarchy chỉ kiểm tra bằng parent_code trong Canonical Admin
-DB, không kiểm tra bằng chuỗi. Nếu áp level-check lên mentions, các unit
-có level khác chuỗi đó (vd. "phuong"/"quan", Enum, ...) sẽ bị veto oan,
-fuzzy trả rỗng hoặc trả nhiều ứng viên, ranker tính margin = 0 nên địa
-chỉ đúng hoàn toàn như golden_11 (79/760/76002) vẫn bị hạ NEEDS_REVIEW.
-
-Veto duy nhất, dùng chung cho exact-match và fuzzy fallback:
-  - ward phải có parent_code là một district tồn tại trong index;
-  - district đó phải thuộc tỉnh đã neo (parent_code == scope.province_code);
-  - nếu scope đã khóa huyện, ward.parent_code phải đúng huyện đó.
-  - ward có parent_code=None bị veto: không chứng minh được thuộc tỉnh/
-    huyện nào thì không được ép province_code của tỉnh đã neo lên nó.
-
-Giữ nguyên hành vi gốc còn lại để không phá các ca đã pass:
-  - giữ nguyên thứ tự: mentions -> ward inverted -> district parsed;
-  - giữ khóa huyện bằng district_units[0] (không dùng _unique_code bỏ khóa
-    khi có nhiều mention — bỏ khóa làm exact-match trả nhiều ứng viên
-    cùng điểm 1.0, margin về 0);
-  - chống trùng ứng viên theo ward_code: cùng một xã chỉ trả một lần,
-    nếu không ranker cũng tính margin = 0.
+Fix fix_fuzzy_exact_match_ignores_district + fix cho golden_11:
+1. Exact-match phải qua cùng veto tỉnh và huyện như nhánh thường.
+   Veto duy nhất, dùng chung cho exact-match và fuzzy fallback, chỉ
+   bằng parent_code (không kiểm tra level — đường mentions gốc không
+   kiểm tra level, validator cũng chỉ kiểm tra parent_code):
+     - ward phải có parent_code là một district tồn tại trong index;
+     - district đó phải thuộc tỉnh đã neo;
+     - nếu scope đã khóa huyện, ward.parent_code phải đúng huyện đó.
+     - ward có parent_code=None bị veto.
+   Giữ nguyên thứ tự gốc và khóa huyện bằng district_units[0]; chống
+   trùng ứng viên theo ward_code để margin không về 0.
+2. Truyền đúng thông tin đã parse vào AddressContract — đây là nguyên
+   nhân golden_11 fail dù mã đúng 79/760/76002: bản gốc tạo contract
+   mà không truyền street / house_number / confidence, nên
+   AddressContract.confidence mặc định 0.0 và has_house_or_street luôn
+   False. Validator luôn cộng warning MISSING_HOUSE_OR_STREET + penalty
+   0.15, gate hạ VERIFIED thành NEEDS_REVIEW cho mọi địa chỉ đúng.
+   Sau fix, cả hai nhánh exact và fallback đều truyền
+   street / house_number / hamlet từ ParsedAddress (nếu có) và
+   confidence = score (1.0 cho exact, difflib score cho fallback).
+   Nếu parsed bỏ sót street/house (dạng "Số 12, đường Lê Lợi" trong
+   khi "127 Nguyễn Trãi" parse được), suy lại từ raw_input bằng
+   `_extract_house_street` trước khi tạo contract.
+3. Fallback không khớp mờ cho tên xã quá ngắn (<4 ký tự sau khi bỏ
+   khoảng trắng): difflib trên chuỗi ngắn tạo ứng viên giả cho các
+   input mơ hồ như 'bi' / 'Xom' — exact-match đã xử lý tên ngắn thật
+   sự, fallback không được tự đoán thêm. Nhánh inverted cũng vậy.
 """
 from __future__ import annotations
 import difflib
+import re
 from dataclasses import dataclass
 from typing import Optional
 from .province_anchor import AdminIndex, AnchorResult, AdminUnit, extract_admin_mentions
@@ -50,11 +53,7 @@ def _district_in_scope(district: AdminUnit, scope: Scope) -> bool:
 
 
 def _ward_in_scope(ward: AdminUnit, scope: Scope, index: AdminIndex) -> bool:
-    """Veto chung cho ward, dùng cho cả exact-match và fuzzy fallback.
-
-    Chỉ bằng parent_code, không kiểm tra level. parent_code=None là veto,
-    không phải là 'không rõ nên cho qua'.
-    """
+    """Veto chung cho ward, dùng cho cả exact-match và fuzzy fallback."""
     if not ward.parent_code:
         return False
     district = index.units.get(ward.parent_code)
@@ -77,6 +76,51 @@ def _dedupe_by_code(units):
     return out
 
 
+def _parsed_field(parsed, *names):
+    if parsed is None:
+        return None
+    if isinstance(parsed, dict):
+        for n in names:
+            value = parsed.get(n)
+            if value not in (None, ""):
+                return value
+        return None
+    for n in names:
+        value = getattr(parsed, n, None)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _extract_house_street(raw_input: str):
+    """Suy số nhà / tên đường từ raw khi parsed bỏ sót.
+
+    Nhận: "Số 12, đường Lê Lợi" -> ("đường Lê Lợi", "12");
+    "127 Nguyễn Trãi" -> ("Nguyễn Trãi", "127").
+    Chỉ dùng khi parsed không có street/house — không ghi đè parsed.
+    """
+    street = None
+    house = None
+    for segment in (raw_input or "").split(","):
+        seg = segment.strip()
+        if not seg:
+            continue
+        low = seg.lower()
+        m = re.match(r"^(?:số|so)\s+(\d+)\b", low)
+        if m:
+            house = m.group(1)
+            continue
+        m = re.search(r"\b(?:đường|duong)\s+(.+)$", seg, flags=re.IGNORECASE)
+        if m:
+            street = "đường " + m.group(1).strip()
+            continue
+        m = re.match(r"^(\d+)\s+(.+)$", seg)
+        if m and street is None:
+            house = m.group(1)
+            street = m.group(2).strip()
+    return street, house
+
+
 class FuzzyMatcher:
     def match(self, parsed: ParsedAddress, anchor: AnchorResult, index: AdminIndex) -> list[AddressCandidate]:
         if not anchor.anchored or anchor.province is None: return []
@@ -86,45 +130,47 @@ class FuzzyMatcher:
         district_units=[u for u in mentions.get("district",[]) if u.parent_code==scope.province_code]
         filtered=[]
         for ward in ward_units:
-            # Sửa duy nhất ở đây so với bản gốc: bỏ nhánh
-            # `elif ward.parent_code is None: filtered.append(ward)`.
-            # Ward không có district cha thì không chứng minh được thuộc tỉnh
-            # đã neo, phải veto thay vì ép vào tỉnh đó.
             if _ward_in_scope(ward, scope, index):
                 filtered.append(ward)
         ward_units=_dedupe_by_code(filtered)
         if district_units and not scope.district_code: scope.district_code=district_units[0].code
         if not ward_units and parsed.ward_name:
             target=normalize_text(parsed.ward_name)
-            for cand in index.inverted.get(target,[]):
-                # Exact-match qua inverted: cùng veto tỉnh + huyện như nhánh
-                # thường. _ward_in_scope dùng scope lúc này (đã có huyện từ
-                # mentions, nếu có); huyện từ parsed sẽ được veto lại ở
-                # vòng candidates bên dưới.
-                if _ward_in_scope(cand, scope, index):
-                    ward_units.append(cand)
-            ward_units=_dedupe_by_code(ward_units)
+            # Tên xã quá ngắn thì không tra inverted: "bi"/"Xom" không
+            # được tự đoán thành một xã nào đó chỉ vì trùng 2-3 ký tự.
+            if len(target.replace(" ", "")) >= 4:
+                for cand in index.inverted.get(target,[]):
+                    if _ward_in_scope(cand, scope, index):
+                        ward_units.append(cand)
+                ward_units=_dedupe_by_code(ward_units)
         if not district_units and parsed.district_name:
             target=normalize_text(parsed.district_name)
             for cand in index.inverted.get(target,[]):
-                # District là unit có parent_code == province_code (không
-                # dùng level để phân biệt district/ward).
                 if cand.parent_code==scope.province_code:
                     district_units.append(cand); scope.district_code=cand.code
+        street=_parsed_field(parsed, "street", "street_name")
+        house_number=_parsed_field(parsed, "house_number", "house_no", "house")
+        hamlet=_parsed_field(parsed, "hamlet")
+        if street is None or house_number is None:
+            raw_street, raw_house = _extract_house_street(parsed.raw_input)
+            if street is None:
+                street = raw_street
+            if house_number is None:
+                house_number = raw_house
         candidates: list[AddressCandidate]=[]
         for ward in ward_units:
-            # Phòng thủ chiều sâu: veto lại với scope cuối cùng (gồm cả
-            # huyện từ parsed.district_name) trước khi tạo contract.
             if not _ward_in_scope(ward, scope, index):
                 continue
             district=index.units.get(ward.parent_code) if ward.parent_code else None
             if district is None or district.parent_code != scope.province_code:
                 continue
-            contract=AddressContract(raw_input=parsed.raw_input,province=anchor.province.name,district=district.name if district else None,ward=ward.name,province_code=anchor.province.code,district_code=district.code if district else None,ward_code=ward.code,source=ProviderSource.INTERNAL_ADMIN_DB)
+            contract=AddressContract(raw_input=parsed.raw_input,province=anchor.province.name,district=district.name if district else None,ward=ward.name,province_code=anchor.province.code,district_code=district.code if district else None,ward_code=ward.code,street=street,house_number=house_number,hamlet=hamlet,confidence=1.0,source=ProviderSource.INTERNAL_ADMIN_DB)
             candidates.append(AddressCandidate(address=contract,provider=ProviderSource.INTERNAL_ADMIN_DB,provider_score=1.0,rank_score=1.0))
         if candidates: return candidates
         target=normalize_text(parsed.ward_name) if parsed.ward_name else ""
         if not target: return []
+        if len(target.replace(" ", "")) < 4:
+            return []
         best=[]
         for district in index.districts_of(scope.province_code):
             if scope.district_code and district.code!=scope.district_code: continue
@@ -138,6 +184,6 @@ class FuzzyMatcher:
             district=index.units.get(ward.parent_code) if ward.parent_code else None
             if district is None or district.parent_code != scope.province_code:
                 continue
-            contract=AddressContract(raw_input=parsed.raw_input,province=anchor.province.name,district=district.name if district else None,ward=ward.name,province_code=anchor.province.code,district_code=district.code if district else None,ward_code=ward.code,source=ProviderSource.INTERNAL_ADMIN_DB)
+            contract=AddressContract(raw_input=parsed.raw_input,province=anchor.province.name,district=district.name if district else None,ward=ward.name,province_code=anchor.province.code,district_code=district.code if district else None,ward_code=ward.code,street=street,house_number=house_number,hamlet=hamlet,confidence=float(score),source=ProviderSource.INTERNAL_ADMIN_DB)
             candidates.append(AddressCandidate(address=contract,provider=ProviderSource.INTERNAL_ADMIN_DB,provider_score=score,rank_score=score))
         return candidates
