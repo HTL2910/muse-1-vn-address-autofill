@@ -4,9 +4,7 @@ Run: python -m pytest tests/test_adapter_idempotency_audit.py -q
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
-
-import pytest
+from typing import Any, List
 
 from src.integrations.pancake_goong_shipping_adapter import (
     AuditRecord,
@@ -32,17 +30,12 @@ def _record(order="ORD-1", raw=RAW, status=OrderAddressStatus.BLOCKED_UNVERIFIED
         None, status, carrier="SPX", carrier_label_id=label, reason_code=reason)
 
 
-# --- idempotency anchored to the order only --------------------------------
-
 def test_key_depends_only_on_order_id():
     k1 = make_idempotency_key("ORD-1", raw_input="dia chi cu", phone_ref="0901")
     k2 = make_idempotency_key("ORD-1", raw_input="dia chi da sua hoan toan khac", phone_ref="0999")
-    k3 = make_idempotency_key("ORD-1")
-    assert k1 == k2 == k3
+    assert k1 == k2 == make_idempotency_key("ORD-1")
     assert make_idempotency_key("ORD-2") != k1
 
-
-# --- audit append-only + hash chain ------------------------------------------
 
 def test_audit_is_append_only_and_keeps_blocked_history():
     store = InMemoryAuditStore()
@@ -56,8 +49,10 @@ def test_audit_is_append_only_and_keeps_blocked_history():
         OrderAddressStatus.NEEDS_REVIEW,
         OrderAddressStatus.COMMITTED,
     ]
+    # Attempt-terminal statuses are superseded by the next decision:
+    # the latest view must reach COMMITTED (this assertion failed when
+    # BLOCKED_* was treated as order-terminal).
     assert store.get_by_idempotency_key(r1.idempotency_key).status == OrderAddressStatus.COMMITTED
-    # Earlier entries were not mutated by later saves.
     assert history[0].reason_code == "NO_CANDIDATES"
     assert history[0].entry_hash and history[1].prev_hash == history[0].entry_hash
     assert history[2].prev_hash == history[1].entry_hash
@@ -71,7 +66,7 @@ def test_audit_chain_detects_tampering():
     assert store.verify_chain() is False
 
 
-def test_terminal_latest_view_is_not_displaced_but_attempt_is_audited():
+def test_committed_latest_view_is_sticky_but_attempt_is_audited():
     store = InMemoryAuditStore()
     committed = _record(status=OrderAddressStatus.COMMITTED, label="LBL-1", reason="OK")
     store.save(committed)
@@ -81,12 +76,19 @@ def test_terminal_latest_view_is_not_displaced_but_attempt_is_audited():
     assert store.verify_chain() is True
 
 
-# --- PII at rest ----------------------------------------------------------------
+def test_blocked_then_label_failed_then_committed_progression():
+    store = InMemoryAuditStore()
+    store.save(_record(status=OrderAddressStatus.BLOCKED_LOW_CONFIDENCE, reason="LOW"))
+    store.save(_record(status=OrderAddressStatus.LABEL_FAILED, reason="LABEL_FAILED:X"))
+    store.save(_record(status=OrderAddressStatus.COMMITTED, label="LBL-2", reason="OK"))
+    latest = store.get_by_idempotency_key(make_idempotency_key("ORD-1"))
+    assert latest.status == OrderAddressStatus.COMMITTED
+    assert latest.carrier_label_id == "LBL-2"
+
 
 def test_stored_audit_has_no_plaintext_pii_and_encrypted_raw_is_recoverable():
     store = InMemoryAuditStore()
-    rec = _record()
-    store.save(rec)
+    store.save(_record())
     stored = store.history()[0]
     assert stored.raw_input == ""
     assert "0901234567" not in json.dumps(stored.provider_responses, ensure_ascii=False)
@@ -95,7 +97,6 @@ def test_stored_audit_has_no_plaintext_pii_and_encrypted_raw_is_recoverable():
     assert stored.raw_input_sha256 == sha256_hex(RAW) == hashlib.sha256(RAW.encode()).hexdigest()
     assert stored.raw_input_encrypted and RAW not in stored.raw_input_encrypted
     assert decrypt_pii(stored.raw_input_encrypted) == RAW
-    # Administrative codes survive scrubbing for dispute tracing.
     assert stored.final_address["province_code"] == "79"
 
 
@@ -119,8 +120,6 @@ def test_scrub_pii_keeps_codes():
     assert scrubbed["customer"]["ward_code"] == "660101"
     assert "0901234567" not in json.dumps(scrubbed)
 
-
-# --- end-to-end: corrected address cannot create a second label ------------------
 
 @dataclass
 class _Candidate:
@@ -173,12 +172,11 @@ def test_corrected_address_replays_committed_label_once():
     adapter = PancakeGoongShippingAdapter(
         _Router(), _Validator(), labels, InMemoryAuditStore(),
         lambda router_result, draft: (_Final(), None))
-    draft1 = PancakeDraft("ORD-9", RAW, {}, "0901234567")
-    first = adapter.process_draft(draft1, "a", "a", anchored_province_code="79")
+    first = adapter.process_draft(PancakeDraft("ORD-9", RAW, {}, "0901234567"),
+                                  "a", "a", anchored_province_code="79")
     assert first.status == OrderAddressStatus.COMMITTED
-    # Customer "corrects" the raw address / phone - same order, same key.
-    draft2 = PancakeDraft("ORD-9", "dia chi da sua khac han 0909999999", {}, "0909999999")
-    second = adapter.process_draft(draft2, "b", "b", anchored_province_code="79")
+    second = adapter.process_draft(PancakeDraft("ORD-9", "dia chi da sua khac han 0909999999", {}, "0909999999"),
+                                   "b", "b", anchored_province_code="79")
     assert second.idempotency_key == first.idempotency_key
     assert second.status == OrderAddressStatus.COMMITTED
-    assert labels.calls == [first.idempotency_key]  # exactly one label created
+    assert labels.calls == [first.idempotency_key]
