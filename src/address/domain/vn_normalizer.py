@@ -69,10 +69,6 @@ __all__ = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Helpers: bỏ dấu, token
-# ---------------------------------------------------------------------------
-
 def strip_diacritics(text: str) -> str:
     """Bỏ dấu tiếng Việt, giữ nguyên chữ cái: 'Đắk Lắk' -> 'Dak Lak'."""
     if not text:
@@ -90,10 +86,6 @@ def _word_tokens(text: str) -> list[str]:
 def _tokens_unsigned(text: str) -> tuple[str, ...]:
     return tuple(strip_diacritics(t).lower() for t in _word_tokens(text))
 
-
-# ---------------------------------------------------------------------------
-# Bảng alias địa danh: danh sách cặp, không dùng dict literal (tránh trùng khóa)
-# ---------------------------------------------------------------------------
 
 class _AliasList(list):
     """Danh sách cặp (alias, canonical) nhưng dùng được như dict cho
@@ -128,8 +120,6 @@ class _AliasList(list):
         return [canonical for _, canonical in self]
 
 
-# Khóa là dạng không dấu, lower, đã chuẩn hóa khoảng trắng.
-# Mỗi khóa chỉ xuất hiện đúng một lần — _build_alias_dict() sẽ raise nếu trùng.
 PLACE_ALIASES = _AliasList([
     ("dak lak", "đắk lắk"),
     ("dak ya", "đăk yă"),
@@ -178,12 +168,7 @@ def check_alias_duplicates(pairs: Iterable[tuple[str, str]]) -> list[str]:
 
 
 def _build_alias_dict(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
-    """Xây dict từ danh sách cặp, raise ngay nếu có trùng khóa.
-
-    Đây là tuyến phòng thủ thay cho việc dict literal ghi đè im lặng:
-    trùng khóa trong tương lai sẽ vỡ ở lúc import / test, không vỡ
-    âm thầm ở lúc match địa chỉ.
-    """
+    """Xây dict từ danh sách cặp, raise ngay nếu có trùng khóa."""
     duplicates = check_alias_duplicates(pairs)
     if duplicates:
         raise ValueError(f"duplicate place-alias keys: {duplicates}")
@@ -191,15 +176,13 @@ def _build_alias_dict(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
 
 
 PLACE_ALIASES_DICT: dict[str, str] = _build_alias_dict(PLACE_ALIASES)
-# Map token-tuple (không dấu) -> canonical, dùng cho khớp ranh giới từ.
 _ALIAS_BY_TOKENS: dict[tuple[str, ...], str] = {
     _tokens_unsigned(alias): canonical for alias, canonical in PLACE_ALIASES
 }
 _ALIAS_LENGTHS = sorted({len(k) for k in _ALIAS_BY_TOKENS}, reverse=True)
 
 # Viết tắt được expand vô điều kiện (token hoàn chỉnh, không mơ hồ).
-# CỐ TÌNH KHÔNG có 'd', 'hn', 'sg' ở đây — xem CONTEXTUAL_ABBREVIATIONS
-# và AMBIGUOUS_SINGLE_TOKENS bên dưới.
+# CỐ TÌNH KHÔNG có 'd', 'hn', 'sg' ở đây.
 ABBREVIATIONS: dict[str, str] = {
     "tp": "thành phố",
     "tphcm": "thành phố hồ chí minh",
@@ -219,17 +202,8 @@ CONTEXTUAL_ABBREVIATIONS: dict[str, str] = {"d": "đường"}
 AMBIGUOUS_SINGLE_TOKENS = frozenset({"hn", "sg", "d", "bi", "xom"})
 
 
-# ---------------------------------------------------------------------------
-# Áp alias và viết tắt
-# ---------------------------------------------------------------------------
-
 def _apply_place_aliases(text: str) -> str:
-    """Khôi phục dấu cho tên địa danh đã biết, theo ranh giới từ.
-
-    Khớp dãy token liên tiếp hoàn chỉnh trong từng đoạn (ngăn bởi dấu
-    phẩy), dài nhất trước. Token không nằm trong bảng alias giữ nguyên
-    (kể cả dấu gốc của nó), nên không làm mất dấu của tên đường khác.
-    """
+    """Khôi phục dấu cho tên địa danh đã biết, theo ranh giới từ."""
     if not text:
         return ""
     out_segments: list[str] = []
@@ -256,14 +230,7 @@ def _apply_place_aliases(text: str) -> str:
 
 
 def _apply_abbreviations(text: str) -> str:
-    """Expand viết tắt vô điều kiện + viết tắt 'd' có ngữ cảnh.
-
-    - ABBREVIATIONS: chỉ khi token khớp hoàn chỉnh, không phải chuỗi con.
-    - 'd' -> 'đường' chỉ khi: có token tên đường theo sau (chữ cái, không
-      phải số, không phải tiền tố hành chính) VÀ ('d' ở đầu đoạn hoặc
-      token trước nó là số nhà). 'd' đứng một mình thì giữ nguyên.
-    - 'hn' / 'sg' không bao giờ expand ở đây.
-    """
+    """Expand viết tắt vô điều kiện + viết tắt 'd' có ngữ cảnh."""
     if not text:
         return ""
     out_segments: list[str] = []
@@ -301,19 +268,10 @@ def fix_diacritics(text: str) -> str:
     return _apply_place_aliases(text)
 
 
-# ---------------------------------------------------------------------------
-# normalize()
-# ---------------------------------------------------------------------------
-
 class NormalizedText(str):
     """Kết quả normalize, vừa là str (giá trị = expanded_diacritic) vừa
     mang các trường mà caller cũ dùng: .fixed_diacritic,
-    .expanded_diacritic, .unsigned, .normalized, .tokens, .original.
-
-    Nhờ kế thừa str, cả hai cách dùng đều đúng:
-        normalize("dak lak") == "đắk lắk"
-        normalize("dak lak").expanded_diacritic == "đắk lắk"
-    """
+    .expanded_diacritic, .unsigned, .normalized, .tokens, .original."""
 
     def __new__(cls, expanded: str, *, original: str = "", fixed_diacritic: str = "",
                 unsigned: str = "", tokens: Sequence[str] = ()):

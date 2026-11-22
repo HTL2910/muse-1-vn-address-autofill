@@ -1,19 +1,9 @@
-"""Hồi quy cho fix_fuzzy_exact_match_ignores_district.
+"""Hồi quy cho fix_fuzzy_exact_match_ignores_district + golden_11.
 
-Exact-match phải qua cùng veto tỉnh và huyện như nhánh fuzzy:
-- xã trùng tên ở huyện khác trong cùng tỉnh, khi huyện đã neo, phải bị veto;
-- xã có parent_code=None phải bị veto, không được ép vào tỉnh đã neo;
-- xã ở tỉnh khác phải bị veto;
-- xã đúng huyện vẫn trả về với score 1.0, chỉ một ứng viên duy nhất;
-- veto chỉ bằng parent_code, không bằng level: unit có level="phuong"/
-  "quan" (không phải chuỗi "ward"/"district") mà parent chain đúng
-  vẫn phải được trả về — đây là hồi quy cho lần fail golden_11.
-
-Test dùng SimpleNamespace cho AdminUnit/AdminIndex/ParsedAddress/AnchorResult
-để không phụ thuộc vào signature constructor của các dataclass đó; chỉ dùng
-đúng các thuộc tính mà FuzzyMatcher.match đọc: code, name, normalized_name,
-level, parent_code, units, inverted, districts_of, wards_of, raw_input,
-ward_name, district_name, anchored, province.
+Exact-match phải qua cùng veto tỉnh và huyện như nhánh fuzzy, và
+contract phải truyền đúng street / house_number / confidence từ parsed
+— nếu không Validator luôn cộng warning MISSING_HOUSE_OR_STREET và
+gate hạ VERIFIED thành NEEDS_REVIEW cho địa chỉ đúng hoàn toàn.
 """
 from __future__ import annotations
 
@@ -42,15 +32,17 @@ def _index(units, inverted, districts, wards_by_district):
     )
 
 
-def _parsed(raw, ward_name="", district_name=""):
-    return SimpleNamespace(raw_input=raw, ward_name=ward_name, district_name=district_name)
+def _parsed(raw, ward_name="", district_name="", street=None, house_number=None):
+    return SimpleNamespace(
+        raw_input=raw, ward_name=ward_name, district_name=district_name,
+        street=street, house_number=house_number,
+    )
 
 
 def _anchor():
     return SimpleNamespace(anchored=True, province=SimpleNamespace(code="66", name="Đắk Lắk"))
 
 
-# Tỉnh 66 Đắk Lắk, huyện 664 Krông Búk, huyện 665 Krông Pắc.
 D1 = _unit("664", "Krông Búk", "district", "66")
 D2 = _unit("665", "Krông Pắc", "district", "66")
 W_RIGHT = _unit("66401", "Cuôr Đăng", "ward", "664")
@@ -159,13 +151,42 @@ def test_veto_is_by_parent_code_not_by_level_string(monkeypatch):
     anchor = SimpleNamespace(anchored=True, province=SimpleNamespace(code="79", name="Hồ Chí Minh"))
     result = FuzzyMatcher().match(
         _parsed("Số 12, đường Lê Lợi, Phường Bến Nghé, Quận 1, Thành phố Hồ Chí Minh",
-                "Bến Nghé", "Quận 1"),
+                "Bến Nghé", "Quận 1", street="đường Lê Lợi", house_number="12"),
         anchor, index,
     )
     assert len(result) == 1
     assert result[0].address.ward_code == "76002"
     assert result[0].address.district_code == "760"
     assert result[0].address.province_code == "79"
+
+
+def test_fuzzy_propagates_street_house_and_confidence(monkeypatch):
+    """Contract từ fuzzy phải có street/house/confidence, nếu không
+    Validator luôn warning MISSING_HOUSE_OR_STREET và gate hạ VERIFIED."""
+    d1 = _unit("760", "Quận 1", "quan", "79")
+    w1 = _unit("76002", "Bến Nghé", "phuong", "760")
+    monkeypatch.setattr(
+        fm, "extract_admin_mentions",
+        lambda raw, index: {"ward": [w1], "district": [d1]},
+    )
+    index = _index(
+        [d1, w1],
+        {normalize_text("Bến Nghé"): [w1]},
+        [d1],
+        {"760": [w1]},
+    )
+    anchor = SimpleNamespace(anchored=True, province=SimpleNamespace(code="79", name="Hồ Chí Minh"))
+    result = FuzzyMatcher().match(
+        _parsed("Số 12, đường Lê Lợi, Phường Bến Nghé, Quận 1, Thành phố Hồ Chí Minh",
+                "Bến Nghé", "Quận 1", street="đường Lê Lợi", house_number="12"),
+        anchor, index,
+    )
+    assert len(result) == 1
+    contract = result[0].address
+    assert contract.street == "đường Lê Lợi"
+    assert contract.house_number == "12"
+    assert contract.has_house_or_street is True
+    assert contract.confidence == 1.0
 
 
 def test_duplicate_mentions_do_not_create_duplicate_candidates(monkeypatch):
