@@ -189,6 +189,34 @@ def test_fuzzy_propagates_street_house_and_confidence(monkeypatch):
     assert contract.confidence == 1.0
 
 
+def test_fuzzy_infers_street_house_from_raw_when_parsed_misses_them(monkeypatch):
+    """Parsed bỏ sót street/house ở dạng "Số 12, đường Lê Lợi" thì
+    fuzzy suy lại từ raw, contract vẫn có has_house_or_street=True."""
+    d1 = _unit("760", "Quận 1", "quan", "79")
+    w1 = _unit("76002", "Bến Nghé", "phuong", "760")
+    monkeypatch.setattr(
+        fm, "extract_admin_mentions",
+        lambda raw, index: {"ward": [w1], "district": [d1]},
+    )
+    index = _index(
+        [d1, w1],
+        {normalize_text("Bến Nghé"): [w1]},
+        [d1],
+        {"760": [w1]},
+    )
+    anchor = SimpleNamespace(anchored=True, province=SimpleNamespace(code="79", name="Hồ Chí Minh"))
+    result = FuzzyMatcher().match(
+        _parsed("Số 12, đường Lê Lợi, Phường Bến Nghé, Quận 1, Thành phố Hồ Chí Minh",
+                "Bến Nghé", "Quận 1"),
+        anchor, index,
+    )
+    assert len(result) == 1
+    contract = result[0].address
+    assert contract.house_number == "12"
+    assert contract.street == "đường Lê Lợi"
+    assert contract.has_house_or_street is True
+
+
 def test_duplicate_mentions_do_not_create_duplicate_candidates(monkeypatch):
     """Cùng một xã được mention 2 lần chỉ trả 1 ứng viên, nếu không margin về 0."""
     monkeypatch.setattr(

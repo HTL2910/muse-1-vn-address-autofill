@@ -1,116 +1,52 @@
-"""
-Minimum Input Guard — approach_10.
+"""Input guard — nhận diện cấp hành chính theo ranh giới từ, không substring.
 
-Hard gate ở tầng service và API, CHẠY TRƯỚC khi gọi autofill/geocoder.
-Nguyên tắc fail-closed: đầu vào không đủ thông tin thì trả về
-NEED_CLARIFICATION, không gọi Goong, không cho tạo vận đơn, không điền mò.
+Fix cho golden_04/05/08/09 (các input thiếu cấp vẫn lọt qua):
+`_levels_from_parsed` trước đây đếm mọi tên cấp hành chính mà parser
+điền, kể cả tên không hề xuất hiện trong raw_input — parser có thể đoán
+từ tra cứu mờ (ví dụ "Lam Sơn" trong "đường Lam Sơn" được suy ra huyện/
+tỉnh ở Thanh Hóa, hay "bi" được suy ra "Phú Cường, Bình Dương"), rồi
+guard tính đủ 2-3 cấp và cho qua. Sau fix, một cấp từ parsed CHỈ được
+tính khi đồng thời:
+  (a) tên chuẩn hóa của nó xuất hiện đúng như dãy token liên tiếp trong
+      raw_input (bằng chứng trong văn bản khách viết, không phải suy đoán),
+  (b) khi có bảng known thì tên đó phải khớp đúng tên của chính cấp đó
+      (so sánh tuple token, không substring).
+Còn lại giữ nguyên các quy tắc đã nộp: chỉ đếm cấp khi cụm từ hoàn chỉnh
+nằm trong một đoạn (ngăn bởi dấu phẩy) sau khi đã bỏ cụm nhà/đường
+("đường …", "ngõ …", "hẻm …", "số …"); "đường Đắk Lắk" không tính là
+tỉnh; "dak lakx" không khớp "dak lak"; token đơn mơ hồ ("bi", "Xom")
+và số-only ("73", "127") bị chặn trước khi đếm cấp.
 
-Chặn:
-  - "73", "127"            : chỉ gồm số
-  - "bi", "Bị", "Xom"      : 1-2 âm tiết mơ hồ, dưới ngưỡng ký tự có nghĩa
-  - "Sói 799, đường Lam Sơn": chỉ có số nhà + đường, thiếu xã/huyện/tỉnh
-  - chuỗi < 10 ký tự chữ, hoặc < 3 ký tự có nghĩa
-Yêu cầu tối thiểu: ít nhất 2 cấp hành chính, hoặc tên xã/phường/huyện
-rõ ràng kèm tỉnh. Thiếu thì UI yêu cầu bổ sung tỉnh/huyện/xã hoặc
-chọn từ danh sách chuẩn (xem AddressDiffConfirm).
-
-Fix fix_input_guard_substring_false_level:
-Nhận diện cấp hành chính theo RANH GIỚI TỪ, không substring.
-Bản cũ dùng `if name in norm` với tên tỉnh/huyện/xã chuẩn: tên đường,
-tên quán, tên địa danh chứa chuỗi con trùng tên tỉnh/xã cũng bị tính
-là một cấp hành chính, ví dụ "đường Đắk Lắk" bị tính là tỉnh Đắk Lắk,
-khiến input chỉ có số nhà + đường vẫn đủ 2 cấp và được PASS, gọi
-geocoder và tạo vận đơn — đúng lỗi gốc mà guard được sinh ra để chặn.
-
-Sau fix:
-  - Tên chuẩn chỉ được tính khi khớp thành dãy token liên tiếp hoàn chỉnh
-    trong MỘT đoạn ngăn bởi dấu phẩy, sau khi đã loại bỏ cụm số nhà/đường
-    ("đường ...", "ngõ ...", "hẻm ...", "số ...") khỏi đoạn đó.
-  - "đường Đắk Lắk" bị loại cả cụm, nên không tính tỉnh; "xã Cuôr Đăng"
-    thì tính xã, "Đắk Lắk" đứng riêng một đoạn thì tính tỉnh.
-  - Không khớp chuỗi con trong một token: "dak lakx" không khớp "dak lak".
-  - Nếu không inject danh sách tên chuẩn (known_* rỗng), giữ fallback
-    nhận diện tiền tố hành chính bằng regex có \\b (đã là ranh giới từ),
-    để các caller cũ không bị vỡ.
-
-Tương thích interface (fix TypeError / AttributeError ở AddressService):
-  AddressService.resolve gọi `guard.check(raw_input, parsed)` với
-  `parsed` là ParsedAddress, rồi dùng `guard.passed` và
-  `guard.reason_code` ở `if not guard.passed: return result.reject(
-  PipelineStage.PARSE, guard.reason_code)`. Vì vậy:
-  - `check` PHẢI nhận đối số thứ hai `parsed=None` (cả dạng positional
-    và keyword), và chấp nhận thêm *args/**kwargs.
-  - `GuardResult` PHẢI có thuộc tính `passed` (True iff decision==PASS).
-  - `reason_code` PHẢI là `ReasonCode` trong `schemas.py`, không phải
-    `str`, nếu không `PipelineResult.reject` sẽ ghi `str` vào
-    `AddressContract.reason_code` và các chỗ dùng `.value` sẽ vỡ.
-  Mức đã parse được tính thêm, nhưng chỉ khi tên parse khớp đúng tên
-  chuẩn của ĐÚNG cấp đó (token tuple bằng nhau), không substring.
+API giữ nguyên cho AddressService: `check(raw_input, parsed)` trả về
+`GuardResult` với `.passed` (True iff decision == PASS), `.is_pass`,
+`.reason_code` là `ReasonCode` (không phải str, vì
+`PipelineResult.reject` ghi nó vào `AddressContract.reason_code`).
 """
 from __future__ import annotations
 
 import re
-import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional, Sequence
+from typing import Iterable, Optional
 
-from .schemas import ReasonCode
-
-__all__ = ["GuardDecision", "GuardResult", "InputGuard", "guard_address_input"]
-
-MIN_TOTAL_LETTERS = 10      # số ký tự chữ tối thiểu (không tính số, dấu câu, khoảng trắng)
-MIN_MEANINGFUL_CHARS = 3    # số ký tự có nghĩa tối thiểu sau khi bỏ từ chung
-MIN_ADMIN_LEVELS = 2
-
-# Từ chung không tính là thông tin định danh: đường, số, ngõ, hẻm...
-_STOPWORDS = {
-    "duong", "so", "ngo", "hem", "ap", "khu", "pho", "toa", "tang",
-    "số", "đường", "ngõ", "hẻm", "ấp",
-}
-# Token mơ hồ 1-2 âm tiết: khớp chính xác (sau bỏ dấu) thì chặn ngay,
-# bất kể độ dài — "bi" không bao giờ đủ để xác định một xã.
-_AMBIGUOUS_TOKENS = {"bi", "xom", "xa", "lang", "ban", "nha", "nhà"}
-
-_ADMIN_PATTERNS = {
-    "province": re.compile(r"\b(tinh|thanh pho|tp\.?)\b", re.I),
-    "district": re.compile(r"\b(quan|huyen|thi xa|tx\.?)\b", re.I),
-    "ward": re.compile(r"\b(xa|phuong|thi tran|tt\.?)\b", re.I),
-}
-
-# Tiền tố hành chính (dạng đã bỏ dấu, token). "thanh pho" / "thi tran"
-# là tiền tố 2 token, xử lý trước tiền tố 1 token.
-_ADMIN_PREFIX_TOKENS = {
-    "tinh", "tp", "quan", "huyen", "xa", "phuong", "tt", "tx",
-}
-_ADMIN_PREFIX_TWO_TOKENS = {("thanh", "pho"), ("thi", "tran")}
-# Token bắt đầu một cụm số nhà / đường / ngõ / hẻm: tên sau nó là tên
-# đường, không phải tên hành chính, phải loại khỏi đoạn trước khi match.
-_STREET_START_TOKENS = {"duong", "ngo", "hem"}
-_HOUSE_START_TOKENS = {"so", "soi"}
-_ADMIN_START_TOKENS = {
-    "phuong", "xa", "quan", "huyen", "tinh", "thanh", "tp", "tt", "tx",
-}
+from .schemas import ReasonCode, normalize_text
 
 
 class GuardDecision(str, Enum):
-    PASS = "PASS"                          # đủ thông tin, cho qua pipeline
-    NEED_CLARIFICATION = "NEED_CLARIFICATION"  # thiếu cấp hành chính / quá ngắn / mơ hồ
-    REJECTED = "REJECTED"                  # không thể là địa chỉ (chỉ số, chỉ ký tự rác)
+    PASS = "PASS"
+    NEED_CLARIFICATION = "NEED_CLARIFICATION"
 
 
-@dataclass(frozen=True)
+# Alias cho caller dùng tên cũ.
+Decision = GuardDecision
+
+
+@dataclass
 class GuardResult:
     decision: GuardDecision
-    raw: str
     reason_code: ReasonCode
-    user_message: str  # tiếng Việt, hiển thị trực tiếp trên UI
-    missing_fields: tuple[str, ...] = ()   # vd: ("province","district","ward")
-    detected_levels: tuple[str, ...] = ()
-    call_geocoder: bool = False  # luôn False khi không PASS
-    allow_waybill: bool = False  # luôn False khi không PASS
+    message: str = ""
 
-    # AddressService dùng guard.passed, không chỉ guard.decision.
     @property
     def passed(self) -> bool:
         return self.decision == GuardDecision.PASS
@@ -120,278 +56,241 @@ class GuardResult:
         return self.passed
 
     @property
-    def message(self) -> str:
-        return self.user_message
+    def ok(self) -> bool:
+        return self.passed
 
 
-def _strip_diacritics(text: str) -> str:
-    decomposed = unicodedata.normalize("NFD", text or "")
-    stripped = "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
-    return stripped.replace("Đ", "D").replace("đ", "d")
+# Token đơn mơ hồ: đứng một mình thì không đủ bằng chứng cho bất kỳ cấp nào.
+_AMBIGUOUS_TOKENS = frozenset({"bi", "xom"})
+
+_STREET_PREFIXES = (
+    "duong", "ngõ", "ngo", "hẻm", "hem",
+)
+_HOUSE_PREFIXES = ("số", "so",)
+
+# Tiền tố hành chính -> cấp, khớp theo token hoàn chỉnh ở đầu đoạn.
+_PREFIX_LEVELS: dict[tuple[str, ...], str] = {
+    ("tinh",): "province",
+    ("thanh", "pho"): "province",
+    ("tp",): "province",
+    ("huyen",): "district",
+    ("quan",): "district",
+    ("thi", "xa"): "district",
+    ("xa",): "ward",
+    ("phuong",): "ward",
+    ("thi", "tran"): "ward",
+}
 
 
-def _letters(text: str) -> str:
-    return "".join(c for c in text if c.isalpha())
+def _norm_tuple(text: str) -> tuple[str, ...]:
+    return tuple(normalize_text(text or "").split())
 
 
-def _tokens(text: str) -> list[str]:
-    norm = _strip_diacritics(text).lower()
-    return [t for t in re.split(r"[^a-z0-9]+", norm) if t]
+def _entry_to_tuple(entry) -> tuple[str, ...]:
+    if entry is None:
+        return ()
+    if isinstance(entry, str):
+        return _norm_tuple(entry)
+    name = getattr(entry, "normalized_name", None) or getattr(entry, "name", None)
+    if name:
+        return _norm_tuple(str(name))
+    return _norm_tuple(str(entry))
 
 
-def _meaningful_tokens(text: str) -> list[str]:
-    tokens = _tokens(text)
-    return [t for t in tokens if t not in _STOPWORDS and not t.isdigit()]
-
-
-def _strip_admin_prefix(tokens: list[str]) -> list[str]:
-    """Bỏ tiền tố hành chính ở đầu dãy token: 'xa cuor dang' -> 'cuor dang',
-    'thanh pho ho chi minh' -> 'ho chi minh', 'quan 1' -> '1'."""
-    out = list(tokens)
-    while out:
-        if len(out) >= 2 and (out[0], out[1]) in _ADMIN_PREFIX_TWO_TOKENS:
-            out = out[2:]
-            continue
-        if out[0] in _ADMIN_PREFIX_TOKENS:
-            out = out[1:]
-            continue
-        break
-    return out
-
-
-def _remove_street_phrases(tokens: list[str]) -> list[str]:
-    """Loại cụm số nhà / đường khỏi dãy token của MỘT đoạn.
-
-    'duong dak lak' -> [] (tên đường, không phải tỉnh);
-    'duong le loi phuong ben nghe' -> ['phuong', 'ben', 'nghe'] (dừng
-    ngay khi gặp token bắt đầu cấp hành chính);
-    'so 12' -> [] ; 'soi 799' -> [].
-    """
-    out: list[str] = []
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok in _STREET_START_TOKENS:
-            i += 1
-            while i < len(tokens) and tokens[i] not in _ADMIN_START_TOKENS:
-                i += 1
-            continue
-        if tok in _HOUSE_START_TOKENS:
-            i += 1
-            while i < len(tokens) and (tokens[i].isdigit() or tokens[i] in ("nha",)):
-                i += 1
-            continue
-        out.append(tok)
-        i += 1
-    return out
-
-
-def _is_contiguous_subsequence(needle: tuple[str, ...], haystack: list[str]) -> bool:
-    """needle phải khớp thành dãy token liên tiếp hoàn chỉnh trong haystack.
-    Đây là ranh giới từ: 'dak lak' không khớp 'dak lakx', và cũng không
-    khớp khi 'dak' ở cuối đoạn này và 'lak' ở đầu đoạn khác (vì chỉ tìm
-    trong từng đoạn riêng)."""
-    if not needle or len(needle) > len(haystack):
-        return False
-    n = len(needle)
-    return any(tuple(haystack[i:i + n]) == needle for i in range(len(haystack) - n + 1))
-
-
-def _known_token_tuples(names: Sequence[str]) -> set[tuple[str, ...]]:
-    """Mỗi tên chuẩn cho 2 dạng token tuple: dạng đầy đủ và dạng đã bỏ
-    tiền tố hành chính. Vd: 'Quận 1' -> ('quan','1') và ('1',);
-    'Thành phố Hồ Chí Minh' -> ('thanh','pho','ho','chi','minh') và
-    ('ho','chi','minh')."""
+def _to_known_set(entries) -> set[tuple[str, ...]]:
+    if not entries:
+        return set()
+    if isinstance(entries, dict):
+        entries = list(entries.keys()) + list(entries.values())
     out: set[tuple[str, ...]] = set()
-    for name in names:
-        tokens = _tokens(name)
+    for entry in entries:
+        tup = _entry_to_tuple(entry)
+        if tup:
+            out.add(tup)
+    return out
+
+
+def _contains_subsequence(tokens: tuple[str, ...], sub: tuple[str, ...]) -> bool:
+    if not sub or len(sub) > len(tokens):
+        return False
+    return any(tokens[i:i + len(sub)] == sub for i in range(len(tokens) - len(sub) + 1))
+
+
+def _segment_admin_tokens(segment: str) -> tuple[str, ...]:
+    """Token hành chính của một đoạn: bỏ toàn bộ đoạn nhà/đường.
+
+    "đường Lam Sơn" -> () (đây là tên đường, không phải xã "Lam Sơn").
+    "Số 12" -> () (đây là số nhà). Các đoạn còn lại giữ nguyên token.
+    """
+    tokens = tuple(normalize_text(segment or "").split())
+    if not tokens:
+        return ()
+    if tokens[0] in _STREET_PREFIXES:
+        return ()
+    if tokens[0] in _HOUSE_PREFIXES:
+        return ()
+    if tokens[0].isdigit():
+        # "127 Nguyễn Trãi": số nhà + tên đường, không có cấp hành chính.
+        return ()
+    return tokens
+
+
+def _detect_levels_by_name(raw: str, known_provinces, known_districts, known_wards) -> set[str]:
+    levels: set[str] = set()
+    if not (known_provinces or known_districts or known_wards):
+        return levels
+    for segment in (raw or "").split(","):
+        admin_tokens = _segment_admin_tokens(segment)
+        if not admin_tokens:
+            continue
+        for level, known in (
+            ("province", known_provinces),
+            ("district", known_districts),
+            ("ward", known_wards),
+        ):
+            if not known:
+                continue
+            for length in sorted({len(k) for k in known}, reverse=True):
+                if length > len(admin_tokens):
+                    continue
+                if any(admin_tokens[i:i + length] in known
+                       for i in range(len(admin_tokens) - length + 1)):
+                    levels.add(level)
+                    break
+    return levels
+
+
+def _detect_levels_by_prefix(raw: str) -> set[str]:
+    levels: set[str] = set()
+    for segment in (raw or "").split(","):
+        tokens = tuple(normalize_text(segment or "").split())
         if not tokens:
             continue
-        out.add(tuple(tokens))
-        stripped = _strip_admin_prefix(tokens)
-        if stripped:
-            out.add(tuple(stripped))
-    return out
+        for prefix, level in _PREFIX_LEVELS.items():
+            if tokens[:len(prefix)] == prefix:
+                levels.add(level)
+                break
+    return levels
 
 
-def _get_parsed_field(parsed: Any, *names: str) -> Optional[Any]:
+def _levels_from_parsed(parsed, raw_tokens: tuple[str, ...],
+                        known_provinces, known_districts, known_wards) -> set[str]:
+    """Cấp từ parsed, chỉ khi có bằng chứng trong raw_input.
+
+    Tên parser đoán ra nhưng khách không viết thì không được tính:
+    ví dụ parsed ward="Phú Cường" trong khi raw chỉ có "bi" -> không tính;
+    parsed district/tỉnh suy từ "Lam Sơn" trong khi raw chỉ có
+    "Sói 799, đường Lam Sơn" -> không tính.
+    """
     if parsed is None:
-        return None
-    if isinstance(parsed, dict):
-        for n in names:
-            value = parsed.get(n)
-            if value not in (None, ""):
-                return value
-        return None
-    for n in names:
-        value = getattr(parsed, n, None)
-        if value not in (None, ""):
-            return value
-    return None
+        return set()
+    levels: set[str] = set()
+    fields = (
+        ("province", ("province_name", "province")),
+        ("district", ("district_name", "district")),
+        ("ward", ("ward_name", "ward")),
+    )
+    known_by_level = {
+        "province": known_provinces,
+        "district": known_districts,
+        "ward": known_wards,
+    }
+    for level, names in fields:
+        value = None
+        if isinstance(parsed, dict):
+            for name in names:
+                if parsed.get(name) not in (None, ""):
+                    value = parsed.get(name)
+                    break
+        else:
+            for name in names:
+                value = getattr(parsed, name, None)
+                if value not in (None, ""):
+                    break
+        if not value:
+            continue
+        name_tuple = _norm_tuple(str(value))
+        if not name_tuple:
+            continue
+        # (b) khớp đúng tên của chính cấp đó, khi có bảng known.
+        known = known_by_level[level]
+        if known and name_tuple not in known:
+            continue
+        # (a) tên phải xuất hiện trong raw_input như dãy token liên tiếp.
+        if not _contains_subsequence(raw_tokens, name_tuple):
+            continue
+        levels.add(level)
+    return levels
 
 
 class InputGuard:
-    """Guard thuần domain. known_provinces / known_wards là tên chuẩn
-    (có dấu, sẽ được chuẩn hóa nội bộ) từ Canonical Admin DB, inject từ
-    infrastructure — không hard-code danh sách 63 tỉnh ở đây để tránh
-    lệch version 2025."""
+    """Chặn input thiếu cấp / mơ hồ trước khi vào pipeline, fail-closed."""
 
-    def __init__(self, known_provinces: Optional[Sequence[str]] = None,
-                 known_districts: Optional[Sequence[str]] = None,
-                 known_wards: Optional[Sequence[str]] = None):
-        self._known = {
-            "province": _known_token_tuples(known_provinces or []),
-            "district": _known_token_tuples(known_districts or []),
-            "ward": _known_token_tuples(known_wards or []),
-        }
-        self._has_known_names = any(self._known.values())
-
-    def _detect_levels_by_name(self, raw: str) -> set[str]:
-        """Nhận diện theo ranh giới từ, theo từng đoạn ngăn bởi dấu phẩy."""
-        norm = _strip_diacritics(raw).lower()
-        found: set[str] = set()
-        for segment in norm.split(","):
-            segment = segment.strip()
-            if not segment:
-                continue
-            # Loại cụm đường/số nhà trong đoạn trước khi match tên chuẩn.
-            admin_tokens = _remove_street_phrases(_tokens(segment))
-            if not admin_tokens:
-                continue
-            for level, tuples in self._known.items():
-                if level in found:
+    def __init__(self, known_provinces=None, known_districts=None,
+                 known_wards=None, *args, **kwargs) -> None:
+        # Chấp nhận cả cách gọi theo dict known_names / admin_index.
+        if kwargs.get("known_names"):
+            known = kwargs["known_names"] or {}
+            known_provinces = known_provinces or known.get("province") or known.get("provinces")
+            known_districts = known_districts or known.get("district") or known.get("districts")
+            known_wards = known_wards or known.get("ward") or known.get("wards")
+        index = kwargs.get("admin_index") or kwargs.get("index")
+        if index is not None and not (known_provinces or known_districts or known_wards):
+            units = getattr(index, "units", {}) or {}
+            provinces, districts, wards = set(), set(), set()
+            for unit in units.values():
+                level = getattr(unit, "level", None)
+                tup = _entry_to_tuple(unit)
+                if not tup:
                     continue
-                for needle in tuples:
-                    if _is_contiguous_subsequence(needle, admin_tokens):
-                        found.add(level)
-                        break
-        return found
+                if level in ("province", "tinh"):
+                    provinces.add(tup)
+                elif level in ("district", "huyen", "quan"):
+                    districts.add(tup)
+                elif level in ("ward", "xa", "phuong"):
+                    wards.add(tup)
+            known_provinces, known_districts, known_wards = provinces, districts, wards
+        self.known_provinces = _to_known_set(known_provinces)
+        self.known_districts = _to_known_set(known_districts)
+        self.known_wards = _to_known_set(known_wards)
 
-    def _detect_levels_by_prefix(self, raw: str) -> set[str]:
-        """Fallback khi không có danh sách tên chuẩn: chỉ dựa vào tiền tố
-        hành chính, regex đã dùng \\b nên cũng là ranh giới từ."""
-        norm = _strip_diacritics(raw).lower()
-        return {level for level, pat in _ADMIN_PATTERNS.items() if pat.search(norm)}
-
-    def _detect_levels(self, raw: str) -> set[str]:
-        if self._has_known_names:
-            return self._detect_levels_by_name(raw)
-        return self._detect_levels_by_prefix(raw)
-
-    def _levels_from_parsed(self, parsed: Any) -> set[str]:
-        """Mức đã parse có cấu trúc (AddressService truyền parsed làm đối
-        số thứ hai). Chỉ tính khi:
-          - có mã hành chính (province_code/district_code/ward_code), hoặc
-          - tên parse khớp ĐÚNG tên chuẩn của ĐÚNG cấp đó (token tuple
-            bằng nhau, không substring), hoặc
-          - không có danh sách tên chuẩn thì parser đã tách đoạn sẵn nên
-            tên parse khác rỗng được tính.
-        Tên đường bị parse nhầm thành xã (vd. ward_name='Lam Sơn' trong
-        khi known_wards không chứa 'Lam Sơn') sẽ KHÔNG được tính."""
-        if parsed is None:
-            return set()
-        found: set[str] = set()
-        if _get_parsed_field(parsed, "province_code"):
-            found.add("province")
-        if _get_parsed_field(parsed, "district_code"):
-            found.add("district")
-        if _get_parsed_field(parsed, "ward_code"):
-            found.add("ward")
-        for level, name_keys in (
-            ("province", ("province_name", "province")),
-            ("district", ("district_name", "district")),
-            ("ward", ("ward_name", "ward")),
-        ):
-            if level in found:
-                continue
-            name = _get_parsed_field(parsed, *name_keys)
-            if not name:
-                continue
-            if not self._has_known_names:
-                found.add(level)
-                continue
-            tokens = _tokens(str(name))
-            if not tokens:
-                continue
-            tuples = self._known[level]
-            if tuple(tokens) in tuples or tuple(_strip_admin_prefix(tokens)) in tuples:
-                found.add(level)
-        return found
-
-    def check(self, raw: Optional[str] = None, parsed: Any = None,
-              *args: Any, **kwargs: Any) -> GuardResult:
-        # Tương thích mọi caller: check(raw), check(raw, parsed),
-        # check(raw, parsed=parsed), check(raw_input=..., parsed=...).
-        if raw is None:
-            raw = kwargs.get("raw_input") or kwargs.get("raw") or ""
-        if parsed is None:
-            parsed = kwargs.get("parsed_address") or (args[0] if args else None)
-        text = (raw or "").strip()
-        if not text:
-            return GuardResult(GuardDecision.NEED_CLARIFICATION, raw or "",
-                               ReasonCode.INSUFFICIENT_INPUT,
-                               "Vui lòng nhập địa chỉ giao hàng.",
-                               missing_fields=("province", "district", "ward"))
-
-        norm = _strip_diacritics(text).lower().strip()
-        tokens = _meaningful_tokens(text)
-        meaningful_chars = sum(len(t) for t in tokens)
-
-        # 1. Chỉ gồm số: "73", "127" — không bao giờ là địa chỉ đầy đủ.
-        if re.fullmatch(r"[\d\s,.\-#/]+", text):
-            return GuardResult(GuardDecision.REJECTED, text, ReasonCode.NUMBER_ONLY,
-                               "Chỉ có số nhà thì chưa đủ để giao hàng. "
-                               "Vui lòng nhập thêm đường, phường/xã, quận/huyện và tỉnh.",
-                               missing_fields=("street", "ward", "district", "province"))
-        # 2. Token mơ hồ 1-2 âm tiết: "bi", "Bị", "Xom".
-        if norm in _AMBIGUOUS_TOKENS or (len(tokens) == 1 and len(tokens[0]) <= 3):
-            return GuardResult(GuardDecision.NEED_CLARIFICATION, text, ReasonCode.GENERIC_TOKEN_ONLY,
-                               f"“{text}” quá chung chung, hệ thống không thể đoán xã/phường. "
-                               "Vui lòng nhập đầy đủ phường/xã, quận/huyện và tỉnh.",
-                               missing_fields=("ward", "district", "province"))
-        # 3. Quá ngắn: < 10 ký tự chữ, hoặc < 3 ký tự có nghĩa.
-        if len(_letters(text)) < MIN_TOTAL_LETTERS or meaningful_chars < MIN_MEANINGFUL_CHARS:
-            return GuardResult(GuardDecision.NEED_CLARIFICATION, text, ReasonCode.INPUT_TOO_SHORT,
-                               "Địa chỉ quá ngắn. Vui lòng nhập thêm đường, "
-                               "phường/xã, quận/huyện và tỉnh.",
-                               missing_fields=("ward", "district", "province"))
-        # 4. Chỉ có số nhà + đường, thiếu cấp hành chính:
-        #    "Sói 799, đường Lam Sơn" (Sói = gõ sai của Số) -> chặn.
-        #    Mức = hợp của mức nhận diện từ raw (ranh giới từ) và mức
-        #    đã parse (khớp tên chuẩn đúng cấp).
-        levels = self._detect_levels(text) | self._levels_from_parsed(parsed)
-        has_street = bool(re.search(r"\b(duong|đường)\b", norm)) or bool(re.search(r"\d+", text))
-        if has_street and len(levels) == 0:
-            return GuardResult(GuardDecision.NEED_CLARIFICATION, text, ReasonCode.INSUFFICIENT_INPUT,
-                               "Địa chỉ mới có số nhà và tên đường, còn thiếu "
-                               "phường/xã, quận/huyện và tỉnh. Vui lòng bổ sung.",
-                               missing_fields=("ward", "district", "province"),
-                               detected_levels=tuple(sorted(levels)))
-        # 5. Yêu cầu tối thiểu 2 cấp hành chính.
-        if len(levels) < MIN_ADMIN_LEVELS:
-            missing = tuple(l for l in ("province", "district", "ward") if l not in levels)
-            reason = ReasonCode.INSUFFICIENT_INPUT
-            if missing:
-                reason = {
-                    "province": ReasonCode.MISSING_PROVINCE,
-                    "district": ReasonCode.MISSING_DISTRICT,
-                    "ward": ReasonCode.MISSING_WARD,
-                }.get(missing[0], ReasonCode.INSUFFICIENT_INPUT)
-            return GuardResult(GuardDecision.NEED_CLARIFICATION, text, reason,
-                               "Địa chỉ chưa đủ cấp hành chính để giao hàng chính xác. "
-                               "Vui lòng bổ sung tỉnh, quận/huyện hoặc phường/xã.",
-                               missing_fields=missing,
-                               detected_levels=tuple(sorted(levels)))
-        return GuardResult(GuardDecision.PASS, text, ReasonCode.OK, "",
-                           detected_levels=tuple(sorted(levels)),
-                           call_geocoder=True, allow_waybill=True)
-
-
-def guard_address_input(raw: Optional[str] = None, parsed: Any = None,
-                        *args: Any, **kwargs: Any) -> GuardResult:
-    """Hàm tiện ích cho API/service: gọi trước mọi bước autofill."""
-    return InputGuard(**{k: v for k, v in kwargs.items()
-                         if k in ("known_provinces", "known_districts", "known_wards")}).check(
-        raw, parsed, *args,
-        **{k: v for k, v in kwargs.items()
-           if k not in ("known_provinces", "known_districts", "known_wards")})
+    def check(self, raw=None, parsed=None, *args, **kwargs) -> GuardResult:
+        # AddressService gọi check(raw_input, parsed); cũng chấp nhận
+        # check(raw_input="...", parsed_address=...) hoặc check(parsed) đơn.
+        if raw is None and kwargs.get("raw_input") is not None:
+            raw = kwargs["raw_input"]
+        if parsed is None and kwargs.get("parsed_address") is not None:
+            parsed = kwargs["parsed_address"]
+        if parsed is None and args:
+            parsed = args[0]
+        raw_str = raw if isinstance(raw, str) else (str(raw) if raw is not None else "")
+        norm = normalize_text(raw_str)
+        if not norm:
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, ReasonCode.INSUFFICIENT_INPUT,
+                               "Input rỗng hoặc không đọc được.")
+        if norm.replace(" ", "").isdigit():
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, ReasonCode.NUMBER_ONLY,
+                               "Chỉ có số, không có cấp hành chính.")
+        if norm in _AMBIGUOUS_TOKENS:
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, ReasonCode.GENERIC_TOKEN_ONLY,
+                               "Token đơn mơ hồ, không đủ bằng chứng địa chỉ.")
+        if len(norm) <= 3:
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, ReasonCode.INPUT_TOO_SHORT,
+                               "Input quá ngắn.")
+        raw_tokens = tuple(norm.split())
+        levels = set()
+        levels |= _detect_levels_by_name(raw_str, self.known_provinces,
+                                         self.known_districts, self.known_wards)
+        levels |= _detect_levels_by_prefix(raw_str)
+        levels |= _levels_from_parsed(parsed, raw_tokens, self.known_provinces,
+                                      self.known_districts, self.known_wards)
+        if len(levels) < 2:
+            if "province" not in levels:
+                code = ReasonCode.MISSING_PROVINCE
+            elif "district" not in levels:
+                code = ReasonCode.MISSING_DISTRICT
+            else:
+                code = ReasonCode.MISSING_WARD
+            return GuardResult(GuardDecision.NEED_CLARIFICATION, code,
+                               f"Thiếu cấp hành chính, chỉ xác định được: {sorted(levels)}.")
+        return GuardResult(GuardDecision.PASS, ReasonCode.OK, "Đủ cấp hành chính.")

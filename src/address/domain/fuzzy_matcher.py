@@ -20,13 +20,17 @@ Fix fix_fuzzy_exact_match_ignores_district + fix cho golden_11:
    Sau fix, cả hai nhánh exact và fallback đều truyền
    street / house_number / hamlet từ ParsedAddress (nếu có) và
    confidence = score (1.0 cho exact, difflib score cho fallback).
+   Nếu parsed bỏ sót street/house (dạng "Số 12, đường Lê Lợi" trong
+   khi "127 Nguyễn Trãi" parse được), suy lại từ raw_input bằng
+   `_extract_house_street` trước khi tạo contract.
 3. Fallback không khớp mờ cho tên xã quá ngắn (<4 ký tự sau khi bỏ
    khoảng trắng): difflib trên chuỗi ngắn tạo ứng viên giả cho các
    input mơ hồ như 'bi' / 'Xom' — exact-match đã xử lý tên ngắn thật
-   sự, fallback không được tự đoán thêm.
+   sự, fallback không được tự đoán thêm. Nhánh inverted cũng vậy.
 """
 from __future__ import annotations
 import difflib
+import re
 from dataclasses import dataclass
 from typing import Optional
 from .province_anchor import AdminIndex, AnchorResult, AdminUnit, extract_admin_mentions
@@ -88,6 +92,35 @@ def _parsed_field(parsed, *names):
     return None
 
 
+def _extract_house_street(raw_input: str):
+    """Suy số nhà / tên đường từ raw khi parsed bỏ sót.
+
+    Nhận: "Số 12, đường Lê Lợi" -> ("đường Lê Lợi", "12");
+    "127 Nguyễn Trãi" -> ("Nguyễn Trãi", "127").
+    Chỉ dùng khi parsed không có street/house — không ghi đè parsed.
+    """
+    street = None
+    house = None
+    for segment in (raw_input or "").split(","):
+        seg = segment.strip()
+        if not seg:
+            continue
+        low = seg.lower()
+        m = re.match(r"^(?:số|so)\s+(\d+)\b", low)
+        if m:
+            house = m.group(1)
+            continue
+        m = re.search(r"\b(?:đường|duong)\s+(.+)$", seg, flags=re.IGNORECASE)
+        if m:
+            street = "đường " + m.group(1).strip()
+            continue
+        m = re.match(r"^(\d+)\s+(.+)$", seg)
+        if m and street is None:
+            house = m.group(1)
+            street = m.group(2).strip()
+    return street, house
+
+
 class FuzzyMatcher:
     def match(self, parsed: ParsedAddress, anchor: AnchorResult, index: AdminIndex) -> list[AddressCandidate]:
         if not anchor.anchored or anchor.province is None: return []
@@ -103,10 +136,13 @@ class FuzzyMatcher:
         if district_units and not scope.district_code: scope.district_code=district_units[0].code
         if not ward_units and parsed.ward_name:
             target=normalize_text(parsed.ward_name)
-            for cand in index.inverted.get(target,[]):
-                if _ward_in_scope(cand, scope, index):
-                    ward_units.append(cand)
-            ward_units=_dedupe_by_code(ward_units)
+            # Tên xã quá ngắn thì không tra inverted: "bi"/"Xom" không
+            # được tự đoán thành một xã nào đó chỉ vì trùng 2-3 ký tự.
+            if len(target.replace(" ", "")) >= 4:
+                for cand in index.inverted.get(target,[]):
+                    if _ward_in_scope(cand, scope, index):
+                        ward_units.append(cand)
+                ward_units=_dedupe_by_code(ward_units)
         if not district_units and parsed.district_name:
             target=normalize_text(parsed.district_name)
             for cand in index.inverted.get(target,[]):
@@ -115,6 +151,12 @@ class FuzzyMatcher:
         street=_parsed_field(parsed, "street", "street_name")
         house_number=_parsed_field(parsed, "house_number", "house_no", "house")
         hamlet=_parsed_field(parsed, "hamlet")
+        if street is None or house_number is None:
+            raw_street, raw_house = _extract_house_street(parsed.raw_input)
+            if street is None:
+                street = raw_street
+            if house_number is None:
+                house_number = raw_house
         candidates: list[AddressCandidate]=[]
         for ward in ward_units:
             if not _ward_in_scope(ward, scope, index):
@@ -127,9 +169,6 @@ class FuzzyMatcher:
         if candidates: return candidates
         target=normalize_text(parsed.ward_name) if parsed.ward_name else ""
         if not target: return []
-        # Tên xã quá ngắn thì không khớp mờ: difflib trên 2-3 ký tự tạo
-        # ứng viên giả cho 'bi' / 'Xom'. Exact-match ở trên đã xử lý
-        # tên ngắn thật sự (nếu có xã đó trong DB).
         if len(target.replace(" ", "")) < 4:
             return []
         best=[]
