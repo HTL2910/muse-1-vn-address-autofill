@@ -1,0 +1,203 @@
+{
+  "version": "1.0.0",
+  "description": "Golden regression cases from real SPX return feedback in the original brief. Every case asserts status, province_code, district_code, ward_code and reason_code. null in an expected code field means: the pipeline must NOT commit any code for that field (fail-closed, no forced autofill).",
+  "status_vocabulary": ["VERIFIED", "NEED_CONFIRMATION", "NEEDS_REVIEW", "REJECTED", "REJECTED_INSUFFICIENT"],
+  "forbidden_default_address": {
+    "ward_name": "Xã Đăk Yă",
+    "district_name": "Mang Yang",
+    "province_name": "Gia Lai",
+    "rule": "No case, under any input, may ever resolve to this address as a system-generated default."
+  },
+  "cases": [
+    {
+      "id": "golden_01_unreadable_no_default",
+      "source": "feedback: 'Không đọc được thì điền mặc định Xã Đăk Yă, Mang Yang, Gia Lai'",
+      "raw_input": "asdf qwer zxcv",
+      "declared_province_code": null,
+      "simulated_provider_suggestion": null,
+      "expected": {
+        "statuses": ["REJECTED", "REJECTED_INSUFFICIENT"],
+        "province_code": null,
+        "district_code": null,
+        "ward_code": null,
+        "reason_codes": ["UNREADABLE_INPUT", "INSUFFICIENT_INFO", "REJECTED_INSUFFICIENT", "FORBIDDEN_DEFAULT"]
+      },
+      "forbidden": {"province_name": "Gia Lai", "district_name": "Mang Yang", "ward_name": "Đăk Yă"}
+    },
+    {
+      "id": "golden_02_forbidden_default_as_input",
+      "source": "regression for schemas forbidden-default handling: must return REJECTED with reason_code, never raise and never commit",
+      "raw_input": "Xã Đăk Yă, Mang Yang, Gia Lai",
+      "declared_province_code": null,
+      "simulated_provider_suggestion": null,
+      "expected": {
+        "statuses": ["REJECTED", "REJECTED_INSUFFICIENT", "NEEDS_REVIEW", "NEED_CONFIRMATION"],
+        "province_code": null,
+        "district_code": null,
+        "ward_code": null,
+        "reason_codes": ["FORBIDDEN_DEFAULT", "NEEDS_REVIEW", "UNVERIFIED_SOURCE"]
+      },
+      "forbidden": {"committed_as_verified": true}
+    },
+    {
+      "id": "golden_03_cuor_dang_dak_lak_not_hai_duong",
+      "source": "feedback: 'xã Cuôr Đăng, Đắk Lắk' was filled as 'Phường Phả Lại, Chí Linh, Hải Dương'",
+      "raw_input": "xã Cuôr Đăng, Đắk Lắk",
+      "declared_province_code": "66",
+      "simulated_provider_suggestion": {
+        "ward_name": "Phường Phả Lại",
+        "district_name": "Chí Linh",
+        "province_name": "Hải Dương",
+        "province_code": "30"
+      },
+      "expected": {
+        "statuses": ["VERIFIED", "NEED_CONFIRMATION", "NEEDS_REVIEW"],
+        "province_code": "66",
+        "district_code": null,
+        "ward_code": null,
+        "reason_codes": ["OK", "PROVINCE_ANCHORED", "NEEDS_CONFIRMATION", "PROVIDER_SUGGESTION_VETOED"]
+      },
+      "forbidden": {"province_code": "30", "province_name": "Hải Dương", "ward_name": "Phả Lại", "district_name": "Chí Linh"}
+    },
+    {
+      "id": "golden_04_xom_too_short",
+      "source": "feedback: 'Xom' was filled as Thanh Mỹ, Nghệ An and shipped",
+      "raw_input": "Xom",
+      "declared_province_code": null,
+      "simulated_provider_suggestion": {"ward_name": "Thanh Mỹ", "province_name": "Nghệ An", "province_code": "40"},
+      "expected": {
+        "statuses": ["REJECTED", "REJECTED_INSUFFICIENT", "NEEDS_REVIEW", "NEED_CONFIRMATION"],
+        "province_code": null,
+        "district_code": null,
+        "ward_code": null,
+        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "NEED_CLARIFICATION", "REJECTED_INSUFFICIENT"]
+      },
+      "forbidden": {"province_name": "Nghệ An", "ward_name": "Thanh Mỹ", "committed_as_verified": true}
+    },
+    {
+      "id": "golden_05_soi_799_lam_son_missing_levels",
+      "source": "feedback: 'Sói 799, đường Lam Sơn' was filled as P2 Tân Bình, SPX returned as wrong address",
+      "raw_input": "Sói 799, đường Lam Sơn",
+      "declared_province_code": null,
+      "simulated_provider_suggestion": {"ward_name": "Phường 2", "district_name": "Tân Bình", "province_name": "Hồ Chí Minh", "province_code": "79"},
+      "expected": {
+        "statuses": ["REJECTED", "REJECTED_INSUFFICIENT", "NEEDS_REVIEW", "NEED_CONFIRMATION"],
+        "province_code": null,
+        "district_code": null,
+        "ward_code": null,
+        "reason_codes": ["INSUFFICIENT_INFO", "MISSING_ADMIN_LEVELS", "NEED_CLARIFICATION", "REJECTED_INSUFFICIENT"]
+      },
+      "forbidden": {"district_name": "Tân Bình", "committed_as_verified": true}
+    },
+    {
+      "id": "golden_06_number_73_only",
+      "source": "feedback: '73' was filled as Hợp Giang, Cao Bằng",
+      "raw_input": "73",
+      "declared_province_code": null,
+      "simulated_provider_suggestion": {"ward_name": "Hợp Giang", "province_name": "Cao Bằng", "province_code": "04"},
+      "expected": {
+        "statuses": ["REJECTED", "REJECTED_INSUFFICIENT"],
+        "province_code": null,
+        "district_code": null,
+        "ward_code": null,
+        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "NUMBER_ONLY", "REJECTED_INSUFFICIENT"]
+      },
+      "forbidden": {"province_name": "Cao Bằng", "ward_name": "Hợp Giang"}
+    },
+    {
+      "id": "golden_07_number_127_only",
+      "source": "feedback: '127' was filled as Hiến Nam, Hưng Yên",
+      "raw_input": "127",
+      "declared_province_code": null,
+      "simulated_provider_suggestion": {"ward_name": "Hiến Nam", "province_name": "Hưng Yên", "province_code": "33"},
+      "expected": {
+        "statuses": ["REJECTED", "REJECTED_INSUFFICIENT"],
+        "province_code": null,
+        "district_code": null,
+        "ward_code": null,
+        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "NUMBER_ONLY", "REJECTED_INSUFFICIENT"]
+      },
+      "forbidden": {"province_name": "Hưng Yên", "ward_name": "Hiến Nam"}
+    },
+    {
+      "id": "golden_08_bi_ambiguous",
+      "source": "feedback: 'bi' was filled as Phú Cường, Thủ Dầu Một",
+      "raw_input": "bi",
+      "declared_province_code": null,
+      "simulated_provider_suggestion": {"ward_name": "Phú Cường", "district_name": "Thủ Dầu Một", "province_name": "Bình Dương", "province_code": "74"},
+      "expected": {
+        "statuses": ["REJECTED", "REJECTED_INSUFFICIENT"],
+        "province_code": null,
+        "district_code": null,
+        "ward_code": null,
+        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "AMBIGUOUS", "REJECTED_INSUFFICIENT"]
+      },
+      "forbidden": {"province_name": "Bình Dương", "ward_name": "Phú Cường", "district_name": "Thủ Dầu Một"}
+    },
+    {
+      "id": "golden_09_bi_accented_ambiguous",
+      "source": "feedback: 'Bị' was filled as Phú Cường, Thủ Dầu Một",
+      "raw_input": "Bị",
+      "declared_province_code": null,
+      "simulated_provider_suggestion": {"ward_name": "Phú Cường", "district_name": "Thủ Dầu Một", "province_name": "Bình Dương", "province_code": "74"},
+      "expected": {
+        "statuses": ["REJECTED", "REJECTED_INSUFFICIENT"],
+        "province_code": null,
+        "district_code": null,
+        "ward_code": null,
+        "reason_codes": ["INSUFFICIENT_INFO", "TOO_SHORT", "AMBIGUOUS", "REJECTED_INSUFFICIENT"]
+      },
+      "forbidden": {"province_name": "Bình Dương", "ward_name": "Phú Cường", "district_name": "Thủ Dầu Một"}
+    },
+    {
+      "id": "golden_10_declared_province_mismatch_blocked",
+      "source": "feedback: customer clearly wrote one province, machine filled another province",
+      "raw_input": "xã Ea Kao, thành phố Buôn Ma Thuột, tỉnh Đắk Lắk",
+      "declared_province_code": "66",
+      "simulated_provider_suggestion": {
+        "ward_name": "Phường Phả Lại",
+        "district_name": "Chí Linh",
+        "province_name": "Hải Dương",
+        "province_code": "30"
+      },
+      "expected": {
+        "statuses": ["VERIFIED", "NEED_CONFIRMATION", "NEEDS_REVIEW"],
+        "province_code": "66",
+        "district_code": null,
+        "ward_code": null,
+        "reason_codes": ["OK", "PROVINCE_ANCHORED", "PROVIDER_SUGGESTION_VETOED", "PROVINCE_MISMATCH"]
+      },
+      "forbidden": {"province_code": "30", "province_name": "Hải Dương"}
+    },
+    {
+      "id": "golden_11_valid_control_hcm_full_address",
+      "source": "valid control case: complete address must still pass, the gate must not block legitimate orders",
+      "raw_input": "Số 12, đường Lê Lợi, Phường Bến Nghé, Quận 1, Thành phố Hồ Chí Minh",
+      "declared_province_code": "79",
+      "simulated_provider_suggestion": null,
+      "expected": {
+        "statuses": ["VERIFIED"],
+        "province_code": "79",
+        "district_code": "760",
+        "ward_code": "26734",
+        "reason_codes": ["OK", "VERIFIED", "PROVINCE_ANCHORED"]
+      },
+      "forbidden": {}
+    },
+    {
+      "id": "golden_12_valid_control_cuor_dang_full",
+      "source": "valid control case: full Cuôr Đăng address must resolve inside Đắk Lắk, never Hải Dương",
+      "raw_input": "Thôn 1, xã Cuôr Đăng, huyện Cư M'gar, tỉnh Đắk Lắk",
+      "declared_province_code": "66",
+      "simulated_provider_suggestion": null,
+      "expected": {
+        "statuses": ["VERIFIED", "NEED_CONFIRMATION", "NEEDS_REVIEW"],
+        "province_code": "66",
+        "district_code": null,
+        "ward_code": null,
+        "reason_codes": ["OK", "PROVINCE_ANCHORED", "NEEDS_CONFIRMATION"]
+      },
+      "forbidden": {"province_code": "30", "province_name": "Hải Dương", "ward_name": "Phả Lại"}
+    }
+  ]
+}
