@@ -1,34 +1,32 @@
 """Validator - fix_validator_carrier_gps.
 
 Hierarchy is checked by parent_code in the Canonical Admin DB, never by
-string prefix (real codes such as 66/652 have no prefix property), and a
-customer-written address is never rejected for matching the forbidden
-default by itself - that decision belongs to the gate.
+string prefix, and a customer-written address is never rejected for
+matching the forbidden default by itself - that decision belongs to
+the gate.
 
 What this fix changes against the previous version:
-1. Carrier checks are PER CARRIER. The carrier that will actually carry
-   the parcel (preferred_carrier / carrier at label time) selects its
-   own servable-ward set and its own admin-code cross-check. Checking
-   SPX data for a GHN parcel is treated as "check unavailable" ->
-   NEEDS_REVIEW, never as a silent pass and never with the wrong set.
-   Carrier conflicts are split by cause: CARRIER_NOT_SERVABLE (ward not
-   served), CARRIER_PROVINCE_MISMATCH / CARRIER_DISTRICT_MISMATCH /
-   CARRIER_WARD_MISMATCH (carrier maps the unit elsewhere, e.g. stale
-   post-2025-merger codes).
-2. GPS: an explicit reverse-geocoder (boundary lookup) is authoritative
-   - a point resolving to another province is GPS_PROVINCE_MISMATCH
-   (error, penalty 0.35); another district is a strong warning. Without
-   a reverse-geocoder the legacy centroid rule is kept as fallback
-   (>200 km from the province centroid -> error). Invalid coordinates
-   (out of range or 0,0) are INVALID_COORDINATES errors.
+1. Carrier checks are PER CARRIER. The carrier that will actually
+   carry the parcel (preferred_carrier / carrier at label time) selects
+   its own servable-ward set and its own admin-code cross-check.
+   Checking SPX data for a GHN parcel is "check unavailable" ->
+   NEEDS_REVIEW, never a silent pass and never with the wrong set.
+   Carrier conflicts are split by cause: CARRIER_NOT_SERVABLE,
+   CARRIER_PROVINCE_MISMATCH / CARRIER_DISTRICT_MISMATCH /
+   CARRIER_WARD_MISMATCH (e.g. stale post-2025-merger codes).
+2. GPS: an explicit reverse-geocoder (boundary lookup) is
+   authoritative - a point resolving to another province is
+   GPS_PROVINCE_MISMATCH (error, penalty 0.35); another district is a
+   strong warning. Without a reverse-geocoder the legacy centroid rule
+   is kept as fallback (>200 km from the province centroid -> error).
+   Invalid coordinates (out of range or 0,0) are INVALID_COORDINATES.
 3. Every check always runs and appends its own field-level reason:
    missing/not-in-DB/mismatch for province, district and ward, street,
    carrier and GPS are collected in one pass so CS can fix all fields
-   at once instead of discovering them one order attempt at a time.
+   at once.
 
 Fail-closed: any error -> BLOCKED, any warning or penalty ->
-NEEDS_REVIEW, only a fully clean address returns OK (the adapter's
-allowlist accepts exactly "OK").
+NEEDS_REVIEW, only a fully clean address returns OK.
 Status: chua chay - ket qua do CI bao.
 """
 from __future__ import annotations
@@ -36,7 +34,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 
 try:  # typing only - the validator works with any index exposing .units
     from .province_anchor import AdminIndex
@@ -90,20 +88,6 @@ class HierarchicalValidator:
                  carrier_checker: Any = None,
                  reverse_geocoder: Any = None,
                  gps_province_error_km: float = 200.0) -> None:
-        """
-        index: AdminIndex (or any object with .units: code -> unit with
-            parent_code and optional centroid_lat/centroid_lng).
-        carrier_servable_wards: legacy single set; applied to whichever
-            carrier is requested (kept for existing callers).
-        carrier_servable: {carrier: set_of_ward_codes} - preferred form.
-        carrier_checker: callable(carrier, province_code, district_code,
-            ward_code) -> dict/object/None, or object with .lookup() /
-            .check(). Result fields: servable (bool), province_code,
-            district_code, ward_code (in OUR canonical codes).
-        reverse_geocoder: callable(lat, lng) -> province code | dict |
-            object, or object with .province_code_for_point() /
-            .reverse_geocode() / .reverse().
-        """
         self.index = index
         self.carrier_servable_wards = carrier_servable_wards
         self.carrier_servable = carrier_servable
@@ -111,11 +95,10 @@ class HierarchicalValidator:
         self.reverse_geocoder = reverse_geocoder
         self.gps_province_error_km = gps_province_error_km
 
-    # -- carrier helpers -----------------------------------------------------
     def _carrier_lookup(self, carrier: str, addr: AddressContract):
         checker = self.carrier_checker
         if checker is None:
-            return None, False  # (result, checker_was_configured)
+            return None, False
         try:
             if callable(checker):
                 return checker(carrier, addr.province_code, addr.district_code, addr.ward_code), True
@@ -129,7 +112,6 @@ class HierarchicalValidator:
 
     def _check_carrier(self, addr: AddressContract, carrier: str,
                        errors: list, warnings: list, penalty: float) -> float:
-        # 1) Servable-ward sets, strictly per carrier.
         servable_set = None
         if self.carrier_servable is not None:
             if carrier in self.carrier_servable:
@@ -140,13 +122,12 @@ class HierarchicalValidator:
                     f"No servable data for carrier {carrier}; cannot verify with another carrier's data."))
                 penalty += 0.20
         if servable_set is None and self.carrier_servable is None:
-            servable_set = self.carrier_servable_wards  # legacy behaviour
+            servable_set = self.carrier_servable_wards
         if servable_set is not None and addr.ward_code and addr.ward_code not in servable_set:
             errors.append(ValidationError(
                 "CARRIER_NOT_SERVABLE", "ward_code",
                 f"Carrier {carrier} does not serve this ward."))
 
-        # 2) Admin-code cross-check with the SAME carrier.
         if self.carrier_checker is not None and addr.ward_code:
             result, _ = self._carrier_lookup(carrier, addr)
             if result is None:
@@ -177,7 +158,6 @@ class HierarchicalValidator:
                         f"Carrier {carrier} maps this address to ward {c_ward}, not {addr.ward_code}."))
         return penalty
 
-    # -- GPS helpers -----------------------------------------------------------
     def _reverse_lookup(self, lat: float, lng: float):
         geo = self.reverse_geocoder
         if geo is None:
@@ -220,7 +200,6 @@ class HierarchicalValidator:
                 penalty += 0.20
             return penalty
 
-        # Fallback (legacy): province centroid distance.
         if self.index is not None and addr.province_code:
             prov = self.index.units.get(addr.province_code)
             if prov is not None:
@@ -235,7 +214,6 @@ class HierarchicalValidator:
                         penalty += 0.35
         return penalty
 
-    # -- main entry --------------------------------------------------------------
     def validate(self, addr: AddressContract, preferred_carrier: str = "SPX",
                  carrier: Optional[str] = None,
                  anchored_province_code: Optional[str] = None) -> ValidationResult:
@@ -244,7 +222,6 @@ class HierarchicalValidator:
         warnings: list[ValidationError] = []
         penalty = 0.0
 
-        # Presence - one reason per field, always collected.
         if not addr.province_code:
             errors.append(ValidationError("MISSING_PROVINCE", "province_code", "Missing province code."))
         if not addr.district_code:
@@ -252,13 +229,11 @@ class HierarchicalValidator:
         if not addr.ward_code:
             errors.append(ValidationError("MISSING_WARD", "ward_code", "Missing ward code."))
 
-        # Anchored province (customer explicitly wrote it) is a hard bound.
         if anchored_province_code and addr.province_code and str(anchored_province_code) != str(addr.province_code):
             errors.append(ValidationError(
                 "PROVINCE_MISMATCH", "province_code",
                 "Proposed province differs from the province the customer explicitly wrote."))
 
-        # Hierarchy + existence in Canonical Admin DB - per field.
         if self.index is not None:
             units = self.index.units
             prov = units.get(addr.province_code or "")
@@ -278,13 +253,10 @@ class HierarchicalValidator:
             if ward is not None and addr.district_code and ward.parent_code != addr.district_code:
                 errors.append(ValidationError("WARD_MISMATCH", "ward_code", "Ward not in district."))
 
-        # Street / house number - runs even when hierarchy already failed,
-        # so the result carries every reason in one pass.
         if not addr.has_house_or_street:
             warnings.append(ValidationError("MISSING_HOUSE_OR_STREET", "street", "Missing house/street."))
             penalty += 0.15
 
-        # Carrier (correct carrier only) and GPS always run as well.
         penalty = self._check_carrier(addr, carrier, errors, warnings, penalty)
         penalty = self._check_gps(addr, errors, warnings, penalty)
 
