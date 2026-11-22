@@ -1,9 +1,14 @@
-"""Address Contract duy nhất — approach_01, canonical cho fix_missing_pipeline_core.
+"""Address Contract duy nhất — approach_01, canonical.
 
-Mọi module parser, anchor, matcher, ranker, validator, gate đều giao
-tiếp qua contract này. Không raise cho lỗi nghiệp vụ: địa chỉ cấm,
-thiếu cấp, sai phân cấp đều trả về bằng status + reason_code, không
-làm sập pipeline. Chỉ validate định dạng mã và lat/lng bằng exception.
+- Phân cấp KHÔNG kiểm tra bằng prefix chuỗi. Mã thật Việt Nam
+  không có tính prefix (Đắk Lắk 66 / Cư M'gar 652, Hà Nội 01 /
+  Ba Đình 001). has_valid_codes chỉ kiểm tra định dạng;
+  parent_code trong AdminIndex mới là nguồn sự thật.
+- FORBIDDEN_DEFAULT chỉ dùng cho observability và cho gate
+  dạng trần (xem confidence_gate.py). Input đầy đủ của khách
+  chứa Đăk Yă không bị coi là default ở schema.
+- PipelineResult.reject giữ nguyên mã/tên đã resolve, chỉ đổi
+  status/reason/confidence.
 """
 from __future__ import annotations
 
@@ -121,8 +126,6 @@ class AddressContract:
     unmatched_tokens: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        # Chỉ lỗi định dạng mới raise. Lỗi nghiệp vụ (default cấm,
-        # thiếu cấp) được biểu diễn bằng status/reason_code.
         if self.province_code and not PROVINCE_CODE_RE.match(self.province_code):
             raise ValueError(f"Invalid province_code: {self.province_code}")
         if self.district_code and not DISTRICT_CODE_RE.match(self.district_code):
@@ -144,8 +147,9 @@ class AddressContract:
     def has_valid_codes(self) -> bool:
         return bool(
             self.province_code and self.district_code and self.ward_code
-            and self.district_code.startswith(self.province_code)
-            and self.ward_code.startswith(self.district_code)
+            and PROVINCE_CODE_RE.match(self.province_code)
+            and DISTRICT_CODE_RE.match(self.district_code)
+            and WARD_CODE_RE.match(self.ward_code)
         )
 
     @property
@@ -207,7 +211,6 @@ class PipelineResult:
     def reject(self, stage: PipelineStage, reason: ReasonCode) -> "PipelineResult":
         self.stage_reached = stage
         self.stage_errors[stage.value] = reason.value
-        # replace() không raise cho default cấm — lỗi nghiệp vụ trả về status.
         self.contract = replace(self.contract, status=AddressStatus.REJECTED,
                                 reason_code=reason, confidence=0.0)
         return self

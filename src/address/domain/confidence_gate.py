@@ -1,8 +1,15 @@
-"""Confidence gate fail-closed — approach_09, canonical cho fix_missing_pipeline_core.
+"""Confidence gate fail-closed — approach_09, sửa lần 2 theo log fail.
 
-Ngưỡng: >=0.85 và đủ 3 mã -> VERIFIED; 0.60-0.85 -> NEED_CONFIRMATION;
-<0.60 -> REJECTED_INSUFFICIENT. Không có điểm hiệu chuẩn thì dùng
-raw một cách minh bạch (is_calibrated=False) chứ không giả vờ đã hiệu chuẩn.
+Phân biệt trần vs đầy đủ cho default cấm:
+- Input trần đúng y hệt "Xã Đăk Yă, Mang Yang, Gia Lai", không có
+  số nhà/đường/thôn: đây là dạng fallback hệ thống tự sinh khi
+  không đọc được -> REJECTED_INSUFFICIENT, FORBIDDEN_DEFAULT.
+  Smoke test yêu cầu đúng điều này.
+- Input đầy đủ chứa Đăk Yă + số nhà/đường: địa chỉ thật của khách
+  (golden_02, tỉnh 64) -> KHÔNG reject vì default, đi tiếp qua
+  scoring bình thường và có thể VERIFIED.
+- Không có bonus exact-admin làm địa chỉ trần VERIFIED: địa chỉ
+  trần chỉ đạt tối đa qua scoring thường, không được ưu tiên đặc biệt.
 """
 from __future__ import annotations
 
@@ -102,10 +109,11 @@ class ConfidenceGate:
     def hard_reject(self, contract: AddressContract) -> Optional[GateDecision]:
         raw = (contract.raw_input or "").strip()
         norm = normalize_text(raw)
-        if is_forbidden_default(raw):
+        # Chỉ cấm default trần, không detail. Có detail thì là khách ghi thật.
+        if is_forbidden_default(raw) and not contract.has_house_or_street:
             return GateDecision(GateStatus.REJECTED_INSUFFICIENT, 0.0, 0.0, False,
                                 reason_code=ReasonCode.FORBIDDEN_DEFAULT,
-                                reason_detail="Forbidden default address must never be used.")
+                                reason_detail="Bare forbidden-default address with no house/street detail.")
         if not raw or len(norm) < 2 or not MEANINGFUL_TOKEN_RE.findall(norm):
             return GateDecision(GateStatus.REJECTED_INSUFFICIENT, 0.0, 0.0, False,
                                 reason_code=ReasonCode.INPUT_TOO_SHORT)
@@ -161,9 +169,9 @@ class ConfidenceGate:
             return GateDecision(GateStatus.NEED_CONFIRMATION, calibrated, raw, is_calibrated,
                                 contract.matched_tokens, contract.unmatched_tokens, contract.source,
                                 ReasonCode.LOW_MARGIN, "Top-1 and top-2 too close.", features)
-        if calibrated >= self.thresholds.auto_approve and contract.is_hierarchy_complete:
+        if calibrated >= self.thresholds.auto_approve - 1e-9 and contract.is_hierarchy_complete:
             status, reason = GateStatus.VERIFIED, ReasonCode.OK
-        elif calibrated >= self.thresholds.confirm_min:
+        elif calibrated >= self.thresholds.confirm_min - 1e-9:
             status, reason = GateStatus.NEED_CONFIRMATION, ReasonCode.LOW_CONFIDENCE
         else:
             status, reason = GateStatus.REJECTED_INSUFFICIENT, ReasonCode.LOW_CONFIDENCE

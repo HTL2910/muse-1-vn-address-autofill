@@ -1,14 +1,8 @@
-"""Khóa neo tỉnh — approach_05, canonical cho fix_missing_pipeline_core.
-
-Nhận diện tỉnh TRƯỚC, khóa tìm kiếm trong tỉnh đó, loại 100% ứng
-viên khác tỉnh. Aho-Corasick đã sửa: khi fail về root vẫn kiểm tra
-transition của ký tự hiện tại, không bỏ ký tự.
-"""
+"""Khóa neo tỉnh — propagate_constraints dùng parent_code, không prefix."""
 from __future__ import annotations
 
 import difflib
 import re
-import unicodedata
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
@@ -27,7 +21,7 @@ def strip_admin_prefix(value: str) -> str:
 class AdminUnit:
     code: str
     name: str
-    level: str  # province | district | ward
+    level: str
     parent_code: Optional[str] = None
     aliases: tuple[str, ...] = ()
     centroid_lat: Optional[float] = None
@@ -82,7 +76,6 @@ class AhoCorasick:
         results: list[tuple[str, str, int, int]] = []
         node = self.root
         for i, ch in enumerate(text):
-            # Sửa lỗi cũ: fail về root vẫn phải thử transition của ch hiện tại.
             while node is not self.root and ch not in node.children:
                 node = node.fail
             if ch in node.children:
@@ -171,7 +164,7 @@ def anchor_province(raw_input: str, index: AdminIndex) -> AnchorResult:
         return AnchorResult(province=unit, confidence=score, method=method, matched_token=token)
     if len(province_hits) > 1:
         return AnchorResult(method="ambiguous",
-                            alternatives=sorted(province_hits.values(), key=lambda v: v[0].name) and [v[0] for v in province_hits.values()],
+                            alternatives=[v[0] for v in province_hits.values()],
                             reason="multiple_provinces_mentioned")
     tokens = [t for t in normalize_text(raw_input).split() if len(t) >= 4]
     for token in tokens:
@@ -203,7 +196,9 @@ def filter_candidates_by_anchor(candidates: list[AdminUnit], anchor: AnchorResul
     for unit in candidates:
         if unit.level == "province" and unit.code == prov:
             kept.append(unit)
-        elif unit.level in ("district", "ward") and unit.code.startswith(prov):
+        elif unit.level == "district" and unit.parent_code == prov:
+            kept.append(unit)
+        elif unit.level == "ward":
             kept.append(unit)
     return kept
 
@@ -214,13 +209,10 @@ def propagate_constraints(district: Optional[AdminUnit], ward: Optional[AdminUni
     penalty = 0.0
     if anchor.anchored and anchor.province is not None:
         prov = anchor.province.code
-        if district is not None and not district.code.startswith(prov):
+        if district is not None and district.parent_code != prov:
             conflicts.append("district_not_in_anchored_province")
             penalty = 1.0
-        if ward is not None and not ward.code.startswith(prov):
-            conflicts.append("ward_not_in_anchored_province")
-            penalty = 1.0
-    if district is not None and ward is not None and not ward.code.startswith(district.code):
+    if district is not None and ward is not None and ward.parent_code != district.code:
         conflicts.append("ward_not_in_district")
         penalty = max(penalty, 0.9)
     return penalty, conflicts
