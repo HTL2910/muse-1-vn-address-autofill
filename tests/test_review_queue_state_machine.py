@@ -74,22 +74,18 @@ def test_reject_to_customer_and_sla_escalation():
 def test_optimistic_concurrency_and_persistence(tmp_path):
     db = str(tmp_path / "review.db")
     q1 = ReviewQueue.with_sqlite(db)
-    q2 = None
+    yellow = q1.enqueue(_item("ORD-Y"))
+    with pytest.raises(ConcurrencyError):
+        q1.approve(yellow.id, "cs-a", expected_version=yellow.version + 99)
+    approved = q1.approve(yellow.id, "cs-a", expected_version=yellow.version)
+    assert approved.version == yellow.version + 1
+    q1.close()  # simulate a full process restart: no shared connection
+    q2 = ReviewQueue.with_sqlite(db)
     try:
-        yellow = q1.enqueue(_item("ORD-Y"))
-        with pytest.raises(ConcurrencyError):
-            q1.approve(yellow.id, "cs-a", expected_version=yellow.version + 99)
-        approved = q1.approve(yellow.id, "cs-a", expected_version=yellow.version)
-        assert approved.version == yellow.version + 1
-        # A brand-new queue over the same DB file still sees the decision:
-        # the store is the source of truth, not process memory.
-        q2 = ReviewQueue.with_sqlite(db)
         loaded = q2.get_by_order("ORD-Y")
         assert loaded is not None and loaded.status == ReviewStatus.APPROVED
     finally:
-        q1.close()
-        if q2 is not None:
-            q2.close()
+        q2.close()
 
 
 def test_customer_confirmed_cross_province_is_not_approved():

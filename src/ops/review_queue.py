@@ -1,6 +1,6 @@
 """
 Risk-tiered manual review queue - approach_15
-Fix: fix_review_queue_state_machine (round 2)
+Fix: fix_review_queue_state_machine (round 3)
 
 Kept from the original: risk tiers (GREEN auto, YELLOW 1-click CS,
 RED hold + ask customer), thresholds 0.90 / 0.65, SLA (YELLOW 15 min,
@@ -36,8 +36,9 @@ What this fix changes:
    - with no validator injected, a structural fallback still requires
      all three admin codes and the anchored province.
    A failed re-validation leaves the item WAITING_CUSTOMER with
-   last_validation_errors recorded so the customer can retry - it is
-   never approved and never silently dropped.
+   last_validation_errors recorded as plain error CODES (dict-shaped
+   validator errors are unwrapped to their "code" field) so the
+   customer can retry - it is never approved, never silently dropped.
 4. Intake stamps created_at with the queue clock, so SLA math compares
    one consistent time source.
 
@@ -102,11 +103,19 @@ TRANSITIONS: Dict[ReviewStatus, frozenset] = {
     ReviewStatus.AUTO_APPROVED: frozenset(),
 }
 TERMINAL_STATUSES = frozenset({ReviewStatus.APPROVED, ReviewStatus.AUTO_APPROVED})
-# Per-actor source states - this is what stops a CS approve from
-# short-circuiting an item that is waiting on the customer.
 CS_ACTION_SOURCES = frozenset({ReviewStatus.PENDING_CS, ReviewStatus.ESCALATED})
 CUSTOMER_CONFIRM_SOURCES = frozenset({
     ReviewStatus.WAITING_CUSTOMER, ReviewStatus.ESCALATED, ReviewStatus.PENDING_CS})
+
+
+def _error_code(error) -> str:
+    """Unwrap a validator error (object with .code, dict with 'code',
+    or a plain string) to its machine-readable code string."""
+    if isinstance(error, dict):
+        code = error.get("code")
+        return str(code) if code else str(error)
+    code = getattr(error, "code", None)
+    return str(code) if code else str(error)
 
 
 @dataclass
@@ -282,7 +291,9 @@ class SQLiteReviewStore:
 
     def close(self) -> None:
         with self._lock:
-            self._conn.close()
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
 
 
 class InMemoryReviewStore:
@@ -529,7 +540,7 @@ class ReviewQueue:
 
     # -- customer confirmation with mandatory re-validation -------------------------
     def _run_validator(self, item: ReviewItem, confirmed: dict):
-        """Returns (outcome, errors): outcome in pass|review|fail|none."""
+        """Returns (outcome, error_codes): outcome in pass|review|fail|none."""
         validator = self._validator
         if validator is None:
             return "none", []
@@ -559,7 +570,7 @@ class ReviewQueue:
         decision = result.get("decision") if isinstance(result, dict) else getattr(result, "decision", None)
         decision = str(getattr(decision, "value", decision) or "").upper()
         raw_errors = result.get("errors") if isinstance(result, dict) else getattr(result, "errors", [])
-        errors = [str(getattr(e, "code", e)) for e in (raw_errors or [])]
+        errors = [_error_code(e) for e in (raw_errors or [])]
         if decision in ("OK", "VERIFIED", "PASS", "APPROVED"):
             return "pass", errors
         if decision in ("NEEDS_REVIEW", "NEED_CONFIRMATION", "REVIEW"):
