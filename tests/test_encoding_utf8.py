@@ -8,8 +8,10 @@ Bao phủ:
 1) src/__init__.py chứa đúng docstring tiếng Việt UTF-8, không mojibake.
 2) Toàn repo sạch theo chính scripts/encoding_check.py (gate dùng ở CI).
 3) Chuỗi mẫu 'Đắk Lắk' và 'Cuôr Đăng' tồn tại nguyên vẹn trong dữ liệu.
-4) Test dương: bộ quét PHẢI bắt được một file mojibake mẫu và một file
-   không giải mã được UTF-8 — tránh trường hợp script hỏng mà vẫn xanh.
+4) Test dương trên dữ liệu trong bộ nhớ (không tạo thư mục tạm trên đĩa
+   — môi trường Windows từng báo PermissionError với tmp_path): bộ quét
+   PHẢI bắt được file mojibake mẫu và file không giải mã được UTF-8, và
+   PHẢI cho qua một cây sạch.
 """
 import importlib.util
 from pathlib import Path
@@ -20,6 +22,8 @@ _spec = importlib.util.spec_from_file_location(
     "encoding_check", REPO_ROOT / "scripts" / "encoding_check.py")
 encoding_check = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(encoding_check)
+
+CLEAN_DATA = '{"tinh": "Đắk Lắk", "xa": "Cuôr Đăng"}'.encode("utf-8")
 
 
 def test_init_docstring_is_correct_utf8_vietnamese():
@@ -41,30 +45,34 @@ def test_sample_vietnamese_place_names_intact():
     assert "Cuôr Đăng" in text
 
 
-def test_scanner_detects_mojibake_file(tmp_path):
-    bad = tmp_path / "bad.py"
-    bad.write_bytes('x = "GÃ³i mÃ£ nguá»“n"\n'.encode("utf-8"))
-    good = tmp_path / "data.json"
-    good.write_text('{"tinh": "Đắk Lắk", "xa": "Cuôr Đăng"}',
-                    encoding="utf-8")
-    violations = encoding_check.find_violations(tmp_path)
+def test_scanner_detects_mojibake_file():
+    files = {
+        "bad.py": 'x = "GÃ³i mÃ£ nguá»“n"\n'.encode("utf-8"),
+        "data.json": CLEAN_DATA,
+    }
+    violations = encoding_check.find_violations_in_bytes(files)
     assert any("bad.py" in v for v in violations)
 
 
-def test_scanner_detects_non_utf8_file(tmp_path):
-    broken = tmp_path / "broken.py"
-    broken.write_bytes(b'x = "\xff\xfe invalid"\n')
-    good = tmp_path / "data.json"
-    good.write_text('{"tinh": "Đắk Lắk", "xa": "Cuôr Đăng"}',
-                    encoding="utf-8")
-    violations = encoding_check.find_violations(tmp_path)
+def test_scanner_detects_non_utf8_file():
+    files = {
+        "broken.py": b'x = "\xff\xfe invalid"\n',
+        "data.json": CLEAN_DATA,
+    }
+    violations = encoding_check.find_violations_in_bytes(files)
     assert any("broken.py" in v for v in violations)
 
 
-def test_scanner_accepts_clean_tree(tmp_path):
-    clean = tmp_path / "clean.py"
-    clean.write_text('"""Gói mã nguồn chính."""\n', encoding="utf-8")
-    data = tmp_path / "data.json"
-    data.write_text('{"tinh": "Đắk Lắk", "xa": "Cuôr Đăng"}',
-                    encoding="utf-8")
-    assert encoding_check.find_violations(tmp_path) == []
+def test_scanner_accepts_clean_tree():
+    files = {
+        "clean.py": '"""Gói mã nguồn chính."""\n'.encode("utf-8"),
+        "data.json": CLEAN_DATA,
+    }
+    assert encoding_check.find_violations_in_bytes(files) == []
+
+
+def test_scanner_flags_missing_sample_strings():
+    files = {"clean.py": b'x = "hello"\n'}
+    violations = encoding_check.find_violations_in_bytes(files)
+    assert any("Đắk Lắk" in v for v in violations)
+    assert any("Cuôr Đăng" in v for v in violations)

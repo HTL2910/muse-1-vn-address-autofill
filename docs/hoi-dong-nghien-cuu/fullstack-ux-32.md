@@ -1,6 +1,6 @@
 # Sửa lỗi `fix/fix_encoding_utf8`: Sửa mojibake UTF-8 và thêm CI kiểm tra encoding
 
-_fullstack-ux · Chuyên gia Ứng dụng & Tích hợp · lần nộp 1_
+_fullstack-ux · Chuyên gia Ứng dụng & Tích hợp · lần nộp 2_
 
 ## Việc được giao
 
@@ -8,9 +8,11 @@ Sửa mojibake UTF-8 và thêm CI kiểm tra encoding
 
 ## Bài làm
 
-Chưa chạy kiểm tra trong phiên này (KHÔNG_CHẠY_LỆNH) — kết quả thật do CI báo lại. Đã đối chiếu trực tiếp với main: `src/__init__.py` đang chứa đúng chuỗi mojibake `GÃ³i mÃ£ nguá»“n chÃ­nh cá»§a dá»± Ã¡n`, và workflow hiện chưa có bước kiểm tra encoding nào.
+Chưa chạy lại test trong phiên này (KHÔNG_CHẠY_LỆNH) — kết quả thật do CI báo lại.
 
-Thiết kế fix: (1) ghi lại `src/__init__.py` bằng UTF-8 đúng; (2) thêm `scripts/encoding_check.py` quét toàn repo — mọi file văn bản phải giải mã được UTF-8, file code/dữ liệu không chứa mẫu mojibake (file `.md` chỉ kiểm tra giải mã, vì tài liệu tranh luận được phép *trích dẫn* chuỗi hỏng làm ví dụ), và bắt buộc tồn tại chuỗi mẫu đúng dấu "Đắk Lắk", "Cuôr Đăng" trong dữ liệu thật; script tự loại trừ chính nó và file test khỏi quét mẫu; (3) thêm bước chạy script + test encoding vào workflow, giữ nguyên mọi bước cũ; (4) `.editorconfig` khóa charset; (5) test hồi quy gồm cả test dương — script phải bắt được file mojibake mẫu trong thư mục tạm.
+Phân tích log: phần encoding cốt lõi đã đạt (docstring đúng, quét repo sạch, chuỗi mẫu nguyên vẹn). Chỉ còn 3 test của chính tôi bị `ERROR ... Permi...` — cả 3 đều là test dùng `tmp_path` để tạo cây thư mục tạm cho bộ quét (môi trường chạy test trên Windows, thư mục tạm gây PermissionError ở setup/teardown, cùng kiểu lỗi với test persistence của review_queue). Sửa tận gốc: tách lõi quét thành hàm thuần trên dữ liệu trong bộ nhớ `find_violations_in_bytes({đường_dẫn: bytes})`, `find_violations(root)` chỉ còn là lớp đọc đĩa (và lỗi đọc file được ghi thành vi phạm thay vì ném exception). 3 test đó chuyển sang API trong bộ nhớ — không chạm đĩa nữa. Các file còn lại giữ nguyên bản đã đạt.
+
+Các fail pipeline/golden/input_guard/aho trong log thuộc các nhánh fix khác chưa merge (guard ở tầng PARSE trả `MISSING_ADMIN_LEVELS` cho "xã Cuôr Đăng, Đắk Lắk" là lỗi của input_guard/province_anchor trên main hiện tại), không phát sinh từ thay đổi encoding này.
 
 (đã nộp file `src/__init__.py`)
 
