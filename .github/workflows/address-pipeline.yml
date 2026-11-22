@@ -4,8 +4,13 @@ on:
     paths:
       - "src/address/**"
       - "src/integrations/**"
+      - "src/__init__.py"
       - "tests/**"
+      - "data/**"
       - "scripts/manifest_check.py"
+      - "scripts/encoding_check.py"
+      - ".editorconfig"
+      - ".github/workflows/address-pipeline.yml"
   push:
     branches: [main]
 jobs:
@@ -18,7 +23,11 @@ jobs:
           python-version: "3.11"
       - name: Manifest check (git ls-files vs published list)
         run: python scripts/manifest_check.py
+      - name: Encoding check (UTF-8 + mojibake)
+        run: python scripts/encoding_check.py
       - name: Compile pipeline
         run: python -m py_compile src/address/domain/*.py src/address/services/address_service.py src/address/api/address_gateway.py
       - name: Import smoke + golden regression
         run: python -m pytest tests/test_pipeline_smoke.py -v
+      - name: Encoding regression tests
+        run: python -m pytest tests/test_encoding_utf8.py -v
