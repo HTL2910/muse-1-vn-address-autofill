@@ -1,6 +1,5 @@
-"""Fuzzy matcher — sửa theo test fail: veto huyện/xã qua parent_code,
-không qua prefix chuỗi. Fallback tra cứu theo tên đã parse trong
-tỉnh đã neo, để ca hợp lệ không bị mất ứng viên khi AC bỏ lỡ.
+"""Fuzzy matcher — veto huyện/xã qua parent_code, không prefix.
+Fallback tra theo tên đã parse trong tỉnh đã neo.
 """
 from __future__ import annotations
 
@@ -29,7 +28,6 @@ class FuzzyMatcher:
         ward_units = [u for u in mentions.get("ward", [])]
         district_units = [u for u in mentions.get("district", [])
                           if u.parent_code == scope.province_code]
-        # Lọc ward: ward phải thuộc một huyện của tỉnh đã neo.
         filtered_wards: list[AdminUnit] = []
         for ward in ward_units:
             district = index.units.get(ward.parent_code or "")
@@ -40,7 +38,6 @@ class FuzzyMatcher:
         ward_units = filtered_wards
         if district_units and not scope.district_code:
             scope.district_code = district_units[0].code
-        # Fallback: tra theo tên đã parse (ward/district) trong tỉnh đã neo.
         if not ward_units and parsed.ward_name:
             target = normalize_text(parsed.ward_name)
             for cand in index.inverted.get(target, []):

@@ -1,14 +1,15 @@
-"""Confidence gate fail-closed — approach_09, sửa theo test fail.
+"""Confidence gate fail-closed — approach_09, sửa lần 2 theo log fail.
 
-- Bỏ hard-reject FORBIDDEN_DEFAULT trên raw_input của khách:
-  Đăk Yă do khách ghi là địa chỉ thật (golden_02, tỉnh 64).
-  Cấm default chỉ có nghĩa khi hệ thống tự sinh fallback khi
-  không đọc được — pipeline này không bao giờ tự sinh, input
-  không đọc được đã bị guard/gate reject với no-address.
-- Exact-match hành chính đủ 3 cấp + đồng thuận provider + margin
-  lớn được VERIFIED dù thiếu số nhà/đường (golden_03): thiếu
-  detail không phủ nhận được xã/huyện/tỉnh đã khớp chính xác.
-  Dùng epsilon 1e-9 cho ngưỡng 0.85 để tránh lỗi float 0.8499999.
+Phân biệt trần vs đầy đủ cho default cấm:
+- Input trần đúng y hệt "Xã Đăk Yă, Mang Yang, Gia Lai", không có
+  số nhà/đường/thôn: đây là dạng fallback hệ thống tự sinh khi
+  không đọc được -> REJECTED_INSUFFICIENT, FORBIDDEN_DEFAULT.
+  Smoke test yêu cầu đúng điều này.
+- Input đầy đủ chứa Đăk Yă + số nhà/đường: địa chỉ thật của khách
+  (golden_02, tỉnh 64) -> KHÔNG reject vì default, đi tiếp qua
+  scoring bình thường và có thể VERIFIED.
+- Không có bonus exact-admin làm địa chỉ trần VERIFIED: địa chỉ
+  trần chỉ đạt tối đa qua scoring thường, không được ưu tiên đặc biệt.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .schemas import (AddressCandidate, AddressContract, GateStatus, ProviderSource,
-                      ReasonCode, normalize_text)
+                      ReasonCode, is_forbidden_default, normalize_text)
 
 NUMBER_ONLY_RE = re.compile(r"^\d{1,6}$")
 MEANINGFUL_TOKEN_RE = re.compile(r"[a-z]{3,}")
@@ -108,7 +109,11 @@ class ConfidenceGate:
     def hard_reject(self, contract: AddressContract) -> Optional[GateDecision]:
         raw = (contract.raw_input or "").strip()
         norm = normalize_text(raw)
-        # Không reject FORBIDDEN_DEFAULT ở đây — xem docstring đầu file.
+        # Chỉ cấm default trần, không detail. Có detail thì là khách ghi thật.
+        if is_forbidden_default(raw) and not contract.has_house_or_street:
+            return GateDecision(GateStatus.REJECTED_INSUFFICIENT, 0.0, 0.0, False,
+                                reason_code=ReasonCode.FORBIDDEN_DEFAULT,
+                                reason_detail="Bare forbidden-default address with no house/street detail.")
         if not raw or len(norm) < 2 or not MEANINGFUL_TOKEN_RE.findall(norm):
             return GateDecision(GateStatus.REJECTED_INSUFFICIENT, 0.0, 0.0, False,
                                 reason_code=ReasonCode.INPUT_TOO_SHORT)
@@ -160,21 +165,12 @@ class ConfidenceGate:
         is_calibrated = bool(getattr(self.calibrator, "fitted", False))
         calibrated = self.calibrator.calibrate(raw) if is_calibrated else raw
         calibrated = max(0.0, min(1.0, calibrated))
-        # Exact admin match: đủ 3 cấp + đồng thuận + margin lớn -> VERIFIED
-        # dù thiếu số nhà/đường (coverage 0.6, raw ~0.85 borderline).
-        exact_admin = (contract.is_hierarchy_complete and agreement >= 1.0 - 1e-9
-                       and features.margin_top1_top2 >= 0.5)
         if len(candidates) > 1 and features.margin_top1_top2 < 0.05:
             return GateDecision(GateStatus.NEED_CONFIRMATION, calibrated, raw, is_calibrated,
                                 contract.matched_tokens, contract.unmatched_tokens, contract.source,
                                 ReasonCode.LOW_MARGIN, "Top-1 and top-2 too close.", features)
-        if (calibrated >= self.thresholds.auto_approve - 1e-9 or exact_admin) and contract.is_hierarchy_complete:
-            # exact_admin mà raw < confirm_min thì vẫn không VERIFIED (an toàn).
-            if exact_admin and calibrated < self.thresholds.confirm_min:
-                status, reason = GateStatus.NEED_CONFIRMATION, ReasonCode.LOW_CONFIDENCE
-            else:
-                status, reason = GateStatus.VERIFIED, ReasonCode.OK
-                calibrated = max(calibrated, self.thresholds.auto_approve)
+        if calibrated >= self.thresholds.auto_approve - 1e-9 and contract.is_hierarchy_complete:
+            status, reason = GateStatus.VERIFIED, ReasonCode.OK
         elif calibrated >= self.thresholds.confirm_min - 1e-9:
             status, reason = GateStatus.NEED_CONFIRMATION, ReasonCode.LOW_CONFIDENCE
         else:

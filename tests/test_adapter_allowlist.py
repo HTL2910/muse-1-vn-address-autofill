@@ -1,9 +1,6 @@
-"""Allowlist tests cho fix_adapter_fail_closed_allowlist.
-
-Chạy: python -m pytest tests/test_adapter_allowlist.py -v
-Không gọi Goong/Pancake/SPX thật; router/validator/labels đều là fake.
-Thêm ca mã thật không có tính prefix: 66/652/24211 vẫn phải qua
-hierarchy (parent_code thuộc validator, adapter chỉ kiểm tra định dạng).
+"""Allowlist tests — giữ nguyên kỳ vọng mapping đã sửa, thêm ca
+mã thật không prefix và ca Đăk Yă đầy đủ vs trần (qua gate, không
+qua adapter trực tiếp — adapter chỉ kiểm tra mapping/confidence).
 """
 from __future__ import annotations
 
@@ -112,7 +109,6 @@ def test_missing_ward_and_province_mismatch_no_label():
 
 
 def test_real_codes_without_prefix_property_still_pass():
-    # Mã thật không có tính prefix: 66 / 652 / 24211 vẫn hợp lệ ở adapter.
     adapter, calls = _adapter(final=_final(province="66", district="652", ward="24211"))
     record = adapter.process_draft(_draft(), "127", "127", "66")
     assert calls["n"] == 1

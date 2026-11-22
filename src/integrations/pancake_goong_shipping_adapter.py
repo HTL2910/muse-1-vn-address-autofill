@@ -1,23 +1,11 @@
 """
 Integration contract: Pancake / Goong / carriers - approach_19
-Branch: expert/backend-sec-m1, fix: fix_adapter_fail_closed_allowlist
-
-Allowlist fail-closed:
-  Nhãn CHỈ tạo khi TẤT CẢ đúng: validator decision in {"OK"},
-  gate status == VERIFIED, confidence >= 0.85 (thiếu thì chặn),
-  đủ 3 mã, anchored province (nếu có) == final province.
-  Mọi trạng thái khác đều chặn, không có đường rơi-through.
-
-Thống nhất trạng thái — sửa lỗi test fail:
-  REJECTED_INSUFFICIENT -> BLOCKED_UNVERIFIED (không qua
-  AddressStatus.REJECTED, vì collapse này làm nó thành
-  BLOCKED_GATE_REJECTED). Mapping kiểm tra chuỗi gốc TRƯỚC
-  khi dùng schemas.
-
-Phân cấp: KHÔNG kiểm tra bằng prefix chuỗi. Mã thật Việt Nam
-không có tính prefix (66/652, 01/001). Chỉ kiểm tra định dạng
-mã + anchored province; kiểm tra parent_code thuộc về validator/
-AdminIndex, không thuộc adapter.
+Fix: fix_adapter_fail_closed_allowlist — allowlist + mapping đã sửa
+ở lần trước, giữ nguyên ở lần này:
+  REJECTED_INSUFFICIENT -> BLOCKED_UNVERIFIED (kiểm tra chuỗi gốc
+  trước, không collapse qua AddressStatus.REJECTED).
+  Phân cấp ở adapter chỉ kiểm tra định dạng + anchored province,
+  không prefix chuỗi.
 """
 from __future__ import annotations
 
@@ -48,7 +36,6 @@ ALLOWED_GATE_STATUSES = frozenset({"VERIFIED"})
 
 
 def gate_status_to_order_status(gate_status: str) -> str:
-    # Kiểm tra chuỗi gốc trước — REJECTED_INSUFFICIENT khác REJECTED.
     value = str(gate_status or "").upper()
     if value == "REJECTED_INSUFFICIENT":
         return OrderAddressStatus.BLOCKED_UNVERIFIED.value
@@ -189,7 +176,6 @@ def _decision_value(decision: Any) -> str:
 
 
 def _hierarchy_ok(final_dict: Dict[str, Any], anchored_province_code: Optional[str]) -> tuple[bool, str]:
-    # Chỉ kiểm tra định dạng + anchored province. Parent_code thuộc validator.
     province = str(final_dict.get("province_code") or "")
     district = str(final_dict.get("district_code") or "")
     ward = str(final_dict.get("ward_code") or "")

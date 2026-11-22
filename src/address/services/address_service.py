@@ -1,12 +1,5 @@
-"""AddressService — entry duy nhất, sửa theo test fail.
-
-- reject() giữ tỉnh đã neo: sau anchor, mọi reject đều mang theo
-  province_code/name đã neo (và district/ward nếu đã match), để
-  golden test đọc được province_code == declared ngay cả khi bị chặn.
-- Không reject Đăk Yă do khách ghi; không tự sinh default nào.
-- Fallback: matcher đã tra theo tên parse; service chỉ cần giữ
-  contract ứng viên, không ghi đè tỉnh bằng candidate lệch tỉnh
-  (ranker đã veto).
+"""AddressService — entry duy nhất. reject() giữ tỉnh đã neo để
+golden đọc được province_code khi bị chặn; không tự sinh default.
 """
 from __future__ import annotations
 
@@ -82,7 +75,6 @@ class AddressService:
         result.stage_reached = PipelineStage.ANCHOR
         if not anchor.anchored or anchor.province is None:
             return result.reject(PipelineStage.ANCHOR, ReasonCode.MISSING_PROVINCE)
-        # Giữ tỉnh đã neo cho mọi reject sau này.
         anchored_contract = replace(base, province=anchor.province.name,
                                     province_code=anchor.province.code)
         result.contract = anchored_contract
@@ -104,7 +96,6 @@ class AddressService:
         result.candidates = ranked.ranked
         result.stage_reached = PipelineStage.RANK
         if ranked.top1 is None:
-            # Lệch tỉnh đã bị veto hết: trả về tỉnh đã neo, không trả None.
             return result.reject(PipelineStage.RANK, ReasonCode.PROVINCE_MISMATCH)
         top = ranked.top1.address
         contract = replace(

@@ -1,7 +1,5 @@
-"""Hierarchical validator — sửa theo test fail.
-
-Phân cấp kiểm tra qua parent_code trong AdminIndex, KHÔNG qua
-prefix chuỗi. Bỏ lỗi FORBIDDEN_DEFAULT trên input khách ghi.
+"""Hierarchical validator — phân cấp qua parent_code, không prefix.
+Không reject FORBIDDEN_DEFAULT ở đây; gate xử lý dạng trần.
 Luôn thu thập warnings dù đã có errors.
 """
 from __future__ import annotations
@@ -60,7 +58,6 @@ class HierarchicalValidator:
             errors.append(ValidationError("MISSING_DISTRICT", "district_code", "Missing district code."))
         if not addr.ward_code:
             errors.append(ValidationError("MISSING_WARD", "ward_code", "Missing ward code."))
-        # Quan hệ cha-con qua parent_code, không qua prefix.
         if self.index is not None:
             district = self.index.units.get(addr.district_code or "")
             if district is not None and addr.province_code and district.parent_code != addr.province_code:

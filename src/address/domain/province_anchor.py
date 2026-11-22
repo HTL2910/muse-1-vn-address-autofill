@@ -1,6 +1,4 @@
-"""Khóa neo tỉnh — sửa theo test fail: propagate_constraints dùng
-parent_code, không dùng prefix chuỗi (mã thật không có tính prefix).
-"""
+"""Khóa neo tỉnh — propagate_constraints dùng parent_code, không prefix."""
 from __future__ import annotations
 
 import difflib
@@ -201,10 +199,6 @@ def filter_candidates_by_anchor(candidates: list[AdminUnit], anchor: AnchorResul
         elif unit.level == "district" and unit.parent_code == prov:
             kept.append(unit)
         elif unit.level == "ward":
-            # Xã thuộc huyện thuộc tỉnh đã neo: kiểm tra qua parent district.
-            district = None
-            # caller có thể tra parent_code; ở đây giữ ward nếu district cha thuộc tỉnh
-            # được kiểm tra ở tầng matcher/validator bằng parent_code.
             kept.append(unit)
     return kept
 
@@ -218,12 +212,6 @@ def propagate_constraints(district: Optional[AdminUnit], ward: Optional[AdminUni
         if district is not None and district.parent_code != prov:
             conflicts.append("district_not_in_anchored_province")
             penalty = 1.0
-        if ward is not None and district is not None and ward.parent_code != district.code:
-            conflicts.append("ward_not_in_district")
-            penalty = max(penalty, 0.9)
-        elif ward is not None and district is None:
-            # Ward không có district đi kèm: không kết luận vội, để matcher tra parent.
-            pass
     if district is not None and ward is not None and ward.parent_code != district.code:
         conflicts.append("ward_not_in_district")
         penalty = max(penalty, 0.9)

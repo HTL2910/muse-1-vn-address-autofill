@@ -1,17 +1,14 @@
 """Address Contract duy nhất — approach_01, canonical.
 
-Sửa theo test fail:
 - Phân cấp KHÔNG kiểm tra bằng prefix chuỗi. Mã thật Việt Nam
   không có tính prefix (Đắk Lắk 66 / Cư M'gar 652, Hà Nội 01 /
-  Ba Đình 001, TP.HCM 79 / Quận 1 760). has_valid_codes chỉ
-  kiểm tra định dạng; parent_code trong AdminIndex mới là nguồn
-  sự thật cho quan hệ cha-con.
-- FORBIDDEN_DEFAULT chỉ dùng cho observability (đếm provider
-  tự sinh fallback). Input do khách tự ghi Đăk Yă là địa chỉ
-  thật, không được reject ở schema/gate/validator.
+  Ba Đình 001). has_valid_codes chỉ kiểm tra định dạng;
+  parent_code trong AdminIndex mới là nguồn sự thật.
+- FORBIDDEN_DEFAULT chỉ dùng cho observability và cho gate
+  dạng trần (xem confidence_gate.py). Input đầy đủ của khách
+  chứa Đăk Yă không bị coi là default ở schema.
 - PipelineResult.reject giữ nguyên mã/tên đã resolve, chỉ đổi
-  status/reason/confidence — để golden test vẫn đọc được
-  province_code đã neo khi bị chặn.
+  status/reason/confidence.
 """
 from __future__ import annotations
 
@@ -40,8 +37,6 @@ def normalize_text(value: str) -> str:
 
 
 def is_forbidden_default(value: str) -> bool:
-    """Chỉ dùng cho observability: phát hiện provider tự sinh fallback.
-    Không dùng để reject input của khách."""
     return normalize_text(value) in FORBIDDEN_DEFAULT_ADDRESSES
 
 
@@ -150,7 +145,6 @@ class AddressContract:
 
     @property
     def has_valid_codes(self) -> bool:
-        # Chỉ định dạng. Quan hệ cha-con kiểm tra qua parent_code ở validator.
         return bool(
             self.province_code and self.district_code and self.ward_code
             and PROVINCE_CODE_RE.match(self.province_code)
@@ -217,7 +211,6 @@ class PipelineResult:
     def reject(self, stage: PipelineStage, reason: ReasonCode) -> "PipelineResult":
         self.stage_reached = stage
         self.stage_errors[stage.value] = reason.value
-        # replace() giữ nguyên province/district/ward đã resolve.
         self.contract = replace(self.contract, status=AddressStatus.REJECTED,
                                 reason_code=reason, confidence=0.0)
         return self
