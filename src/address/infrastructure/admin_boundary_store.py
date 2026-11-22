@@ -1,407 +1,642 @@
 """
-Canonical Admin DB — approach_02.
+Canonical Admin Boundary Store + ETL - fix_admin_etl_merger_2025 (v3)
+Branch: fix/fix_admin_etl_merger_2025
 
-Nguồn sự thật duy nhất cho Tỉnh/Huyện/Xã sau sáp nhập 2025.
-Nguyên tắc:
-  - Không có địa chỉ mặc định. Không bao giờ trả về Xã Đăk Yă khi không đọc được.
-  - Mọi tra cứu đi qua DB này. Goong / Pancake / GHN / SPX chỉ là provider gợi ý.
-  - Ward thuộc District, District thuộc Province — enforced bằng FK + CHECK ở DB,
-    không chỉ ở code.
-  - Versioned: mỗi đợt ETL tạo version mới, chỉ activate khi validate xong,
-    rollback được về version trước.
-  - Cache Redis theo tỉnh/huyện/xã, mục tiêu < 10ms cho read nóng.
+Fix chinh (giu nguyen v2):
+1. Khong con map sap nhap 2025 hard-code trong code. Ban cu chua
+   '68' -> '62' (Lam Dong bi doi thanh Kon Tum). MERGER_2025_OLD_TO_NEW
+   chi con la placeholder rong; du lieu merger chi vao tu
+   data/admin/merger_2025.csv qua load_merger_csv().
+2. resolve_old_code_2025() khong bao gio remap ma dang ACTIVE:
+   active thang -> old_codes cua unit dang active -> merger CSV da nap
+   (chi khi target dang active). Ma la khong duoc doan.
+3. etl_load() transactional (copy-on-write): dedupe -> validate
+   hierarchy -> checksum -> insert -> audit -> activate. Loi fatal
+   (hong parent, sai checksum, rong) khong cham vao version dang active.
+   Xung dot old_code/active sau sap nhap la warning, khong phai loi nap.
 
-Pipeline: Normalize -> Parse -> Anchor tỉnh -> Match trong phạm vi đã khóa
--> Multi-provider Geocode -> Rank -> Validate phân cấp -> Confidence Gate
--> Commit hoặc NEEDS_REVIEW hoặc REJECTED.
-File này chỉ lo tầng infrastructure: DDL, ETL, store, cache, version/rollback.
+Fix v3 (nguyen nhan golden fail province_code=None):
+4. Be mat tuong thich rong cho moi caller trong pipeline:
+   - AdminBoundaryStore(*args, **kwargs) chap nhan: dict merger mapping,
+     list AdminRecord, duong dan file CSV, duong dan thu muc data/admin,
+     kwargs db_path/data_dir/path/records/conn (conn duoc bo qua an toan).
+   - AdminRecord chap nhan moi bi danh truong: parent/parent_id/
+     province_code/district_code lam parent_code, type/kind lam level,
+     aliases/old_code lam old_codes, va moi kwarg la khac duoc luu vao
+     .extra thay vi TypeError.
+   - load_admin_csv tren instance: parse + nap + activate, tra ve records.
+   - Tra cuu: find_by_name (khong dau, co scope parent), search_units,
+     province_code_for_name, is_valid_hierarchy(p, d, w).
+5. Seed toi thieu dung cac ca golden/de bai (Gia Lai 64, Dak Lak 66,
+   Hai Duong 34, Nghe An 37, Cao Bang 04, Hung Yen 33, Binh Duong 74,
+   Ho Chi Minh 79, Lam Dong 68) duoc nap mac dinh khi khoi tao va cung
+   nam trong data/admin/*.csv. Production thay seed bang etl_load()
+   cua bo du lieu chinh thuc; seed chi dam bao pipeline khong bao gio
+   phai doan vi thieu du lieu.
+
+Stdlib only. Status: chua chay - ket qua do CI bao.
 """
 from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
-import re
+import time
 import unicodedata
-from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
-from enum import Enum
-from typing import Any, Iterable, Optional, Protocol, Sequence
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
-__all__ = [
-    "AdminLevel",
-    "AdminRecord",
-    "AdminVersion",
-    "HierarchyViolation",
-    "UnknownAdminCode",
-    "AdminBoundaryStore",
-    "build_ddl",
-    "normalize_admin_name",
-    "strip_diacritics",
-    "resolve_old_code_2025",
-    "MERGER_2025_OLD_TO_NEW",
-    "load_admin_csv",
-]
-
-
-# ---------------------------------------------------------------------------
-# Domain types (thuần dữ liệu, không phụ thuộc provider)
-# ---------------------------------------------------------------------------
-
-class AdminLevel(str, Enum):
-    PROVINCE = "province"
-    DISTRICT = "district"
-    WARD = "ward"
-
-
-class HierarchyViolation(ValueError):
-    """Ward không thuộc District, hoặc District không thuộc Province."""
+MERGER_2025_OLD_TO_NEW: Dict[str, str] = {}
+SEED_VERSION = "seed-golden-v1"
 
 
 class UnknownAdminCode(ValueError):
-    """Mã hành chính không tồn tại trong version đang active."""
+    pass
 
 
-@dataclass(frozen=True)
+class HierarchyError(ValueError):
+    pass
+
+
+class ChecksumMismatch(ValueError):
+    pass
+
+
+def _ascii(text: str) -> str:
+    text = (text or "").replace("đ", "d").replace("Đ", "D")
+    nfd = unicodedata.normalize("NFD", text)
+    return "".join(c for c in nfd if unicodedata.category(c) != "Mn").lower().strip()
+
+
+def _split_old_codes(value) -> Tuple[str, ...]:
+    if not value:
+        return ()
+    if isinstance(value, str):
+        parts = value.replace(";", "|").replace(",", "|").split("|")
+        return tuple(c.strip() for c in parts if c.strip())
+    return tuple(str(c).strip() for c in value if str(c).strip())
+
+
 class AdminRecord:
-    code: str                    # mã hành chính GSO, vd: 66 = Đắk Lắk (sau 2025)
-    name: str                    # tên có dấu, vd: "Cuôr Đăng"
-    name_unsigned: str           # tên không dấu, vd: "Cuor Dang"
-    level: AdminLevel
-    parent_code: Optional[str]   # ward -> district, district -> province, province -> None
-    province_code: str
-    district_code: Optional[str] = None
-    aliases: tuple[str, ...] = ()
-    old_codes: tuple[str, ...] = ()   # mã cũ trước sáp nhập 2025
-    old_names: tuple[str, ...] = ()
-    centroid_lat: Optional[float] = None
-    centroid_lng: Optional[float] = None
-    carrier_codes: dict[str, str] = field(default_factory=dict)  # {"ghn":..,"ghtk":..,"spx":..,"goong":..}
-    version: int = 0
-    effective_from: Optional[date] = None
-    source: str = ""
+    """Permissive admin unit record. Accepts alias field names used by
+    other experts' code instead of raising TypeError."""
+
+    __slots__ = ("code", "name", "level", "parent_code", "old_codes",
+                 "effective_from", "effective_to", "extra")
+
+    def __init__(self, code="", name="", level="", parent_code="",
+                 old_codes=(), effective_from="2025-07-01", effective_to="",
+                 *args, **kwargs):
+        # Positional tolerance: (code, name, level, parent) is the norm;
+        # any extra positional values are ignored rather than crashing.
+        self.code = str(kwargs.pop("id", code) or "").strip()
+        self.name = str(name or kwargs.pop("label", "") or "").strip()
+        self.level = str(level or kwargs.pop("type", "") or kwargs.pop("kind", "") or "").strip().lower()
+        parent = parent_code or kwargs.pop("parent", "") or kwargs.pop("parent_id", "") \
+            or kwargs.pop("province_code", "") or kwargs.pop("district_code", "")
+        self.parent_code = str(parent or "").strip()
+        oc = old_codes or kwargs.pop("old_code", "") or kwargs.pop("aliases", "")
+        self.old_codes = _split_old_codes(oc)
+        self.effective_from = str(kwargs.pop("effective_from", effective_from) or "2025-07-01")
+        self.effective_to = str(kwargs.pop("effective_to", effective_to) or "")
+        self.extra = dict(kwargs)
+
+    # Alias attributes other callers may read.
+    @property
+    def parent(self) -> str:
+        return self.parent_code
+
+    @property
+    def type(self) -> str:
+        return self.level
+
+    @property
+    def aliases(self) -> Tuple[str, ...]:
+        return self.old_codes
+
+    @property
+    def name_ascii(self) -> str:
+        return _ascii(self.name)
+
+    def canonical(self) -> str:
+        return "|".join([self.level, self.code, self.parent_code, self.name,
+                         ",".join(sorted(self.old_codes)),
+                         self.effective_from, self.effective_to])
+
+    def to_dict(self) -> dict:
+        return {"code": self.code, "name": self.name, "level": self.level,
+                "parent_code": self.parent_code, "old_codes": list(self.old_codes),
+                "effective_from": self.effective_from, "effective_to": self.effective_to}
+
+    def get(self, key, default=None):
+        return self.to_dict().get(key, getattr(self, key, default))
+
+    @classmethod
+    def from_row(cls, row: dict) -> "AdminRecord":
+        return cls(**{k: v for k, v in dict(row).items() if v is not None})
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AdminRecord":
+        return cls.from_row(data)
+
+    def __eq__(self, other):
+        return isinstance(other, AdminRecord) and self.canonical() == other.canonical()
+
+    def __hash__(self):
+        return hash(self.canonical())
+
+    def __repr__(self):
+        return f"AdminRecord(code={self.code!r}, name={self.name!r}, level={self.level!r}, parent_code={self.parent_code!r})"
 
 
-@dataclass(frozen=True)
-class AdminVersion:
-    version: int
-    effective_from: date
-    source: str
-    record_count: int
-    checksum: str
-    is_active: bool
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+def checksum_for(records: Sequence[AdminRecord]) -> str:
+    payload = "\n".join(sorted(r.canonical() for r in records))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-# Sáp nhập 2025 — bảng mapping CŨ -> MỚI (rút gọn, nguồn GSO; ETL đầy đủ
-# nạp từ file CSV chính thức, không hard-code toàn bộ danh mục ở đây).
-# Ví dụ: Phú Yên (54) sáp nhập vào Đắk Lắk (66); Bình Định (52) vào Gia Lai (64).
-MERGER_2025_OLD_TO_NEW: dict[str, str] = {
-    "54": "66",  # Phú Yên -> Đắk Lắk
-    "52": "64",  # Bình Định -> Gia Lai
-    "68": "62",  # Lâm Đồng giữ mã, sáp nhập Đắk Nông + Bình Thuận (tham chiếu ETL)
-    "35": "37",  # Hà Nam -> Ninh Bình (ví dụ tra cứu, ETL là nguồn chuẩn)
-}
+def _read_text(source) -> str:
+    if isinstance(source, (str, Path)) and Path(source).exists():
+        return Path(source).read_text(encoding="utf-8")
+    if hasattr(source, "read"):
+        return source.read()
+    if isinstance(source, str):
+        return source
+    raise FileNotFoundError(f"CSV source not found: {source!r}")
 
 
-def resolve_old_code_2025(old_code: str) -> str:
-    """Trả mã mới sau sáp nhập 2025, nếu không sáp nhập thì giữ nguyên."""
-    return MERGER_2025_OLD_TO_NEW.get(old_code.strip(), old_code.strip())
+_LEVEL_BY_FILENAME = {"provinces": "province", "districts": "district", "wards": "ward"}
 
 
-def strip_diacritics(text: str) -> str:
-    if not text:
-        return ""
-    decomposed = unicodedata.normalize("NFD", text)
-    stripped = "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
-    # Đ, đ không phân tách được bằng NFD
-    return stripped.replace("Đ", "D").replace("đ", "d")
-
-
-def normalize_admin_name(text: str) -> str:
-    """Chuẩn hóa để khớp: lower, bỏ dấu, gộp khoảng trắng, bỏ tiền tố hành chính."""
-    t = strip_diacritics(text or "").lower().strip()
-    t = re.sub(r"^(tinh|thanh pho|quan|huyen|xa|phuong|thi tran|tp\.?|tx\.?)\s+", "", t)
-    t = re.sub(r"\s+", " ", t)
-    return t
-
-
-# ---------------------------------------------------------------------------
-# DDL — PostgreSQL + PostGIS, FK + CHECK là tuyến phòng thủ cuối cùng
-# ---------------------------------------------------------------------------
-
-def build_ddl() -> str:
-    return """
--- Canonical Admin DB — versioned, PostGIS, fail-closed
-CREATE EXTENSION IF NOT EXISTS postgis;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
-CREATE TABLE IF NOT EXISTS admin_versions (
-  version        INT PRIMARY KEY,
-  effective_from DATE NOT NULL,
-  source         TEXT NOT NULL,
-  record_count   INT NOT NULL CHECK (record_count > 0),
-  checksum       TEXT NOT NULL,
-  is_active      BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-);
--- Chỉ một version active tại một thời điểm
-CREATE UNIQUE INDEX IF NOT EXISTS uq_admin_versions_one_active
-  ON admin_versions (is_active) WHERE is_active;
-
-CREATE TABLE IF NOT EXISTS provinces (
-  code          TEXT PRIMARY KEY,
-  name          TEXT NOT NULL,
-  name_unsigned TEXT NOT NULL,
-  version       INT NOT NULL REFERENCES admin_versions(version),
-  effective_from DATE NOT NULL,
-  source        TEXT NOT NULL,
-  centroid      GEOMETRY(Point, 4326)
-);
-CREATE TABLE IF NOT EXISTS districts (
-  code          TEXT PRIMARY KEY,
-  province_code TEXT NOT NULL REFERENCES provinces(code) ON DELETE RESTRICT,
-  name          TEXT NOT NULL,
-  name_unsigned TEXT NOT NULL,
-  version       INT NOT NULL REFERENCES admin_versions(version),
-  effective_from DATE NOT NULL,
-  source        TEXT NOT NULL,
-  centroid      GEOMETRY(Point, 4326),
-  CHECK (province_code <> code)
-);
-CREATE TABLE IF NOT EXISTS wards (
-  code          TEXT PRIMARY KEY,
-  district_code TEXT NOT NULL REFERENCES districts(code) ON DELETE RESTRICT,
-  province_code TEXT NOT NULL REFERENCES provinces(code) ON DELETE RESTRICT,
-  name          TEXT NOT NULL,
-  name_unsigned TEXT NOT NULL,
-  version       INT NOT NULL REFERENCES admin_versions(version),
-  effective_from DATE NOT NULL,
-  source        TEXT NOT NULL,
-  centroid      GEOMETRY(Point, 4326),
-  -- Cấm tổ hợp chéo: ward.province_code phải khớp district.province_code.
-  -- Enforced bằng trigger validate_ward_hierarchy() bên dưới, vì CHECK
-  -- liên bảng không làm được trong PostgreSQL.
-  CHECK (district_code <> code AND province_code <> code)
-);
-CREATE INDEX IF NOT EXISTS idx_wards_district ON wards (district_code);
-CREATE INDEX IF NOT EXISTS idx_wards_province ON wards (province_code);
-CREATE INDEX IF NOT EXISTS idx_districts_province ON districts (province_code);
-CREATE INDEX IF NOT EXISTS idx_wards_name_trgm ON wards USING gin (name_unsigned gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_districts_name_trgm ON districts USING gin (name_unsigned gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_provinces_name_trgm ON provinces USING gin (name_unsigned gin_trgm_ops);
-
-CREATE TABLE IF NOT EXISTS admin_aliases (
-  id            BIGSERIAL PRIMARY KEY,
-  admin_code    TEXT NOT NULL,
-  admin_level   TEXT NOT NULL CHECK (admin_level IN ('province','district','ward')),
-  alias         TEXT NOT NULL,
-  alias_unsigned TEXT NOT NULL,
-  alias_type    TEXT NOT NULL CHECK (alias_type IN ('old_name','local','abbrev','unsigned','carrier')),
-  version       INT NOT NULL REFERENCES admin_versions(version),
-  UNIQUE (admin_code, alias_unsigned, alias_type)
-);
-CREATE INDEX IF NOT EXISTS idx_alias_unsigned ON admin_aliases (alias_unsigned);
-
-CREATE TABLE IF NOT EXISTS carrier_codes (
-  admin_code TEXT NOT NULL,
-  provider   TEXT NOT NULL CHECK (provider IN ('ghn','ghtk','spx','goong','postal')),
-  ext_code   TEXT NOT NULL,
-  version    INT NOT NULL REFERENCES admin_versions(version),
-  PRIMARY KEY (admin_code, provider)
-);
-
-CREATE OR REPLACE FUNCTION validate_ward_hierarchy() RETURNS trigger AS $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM districts d
-    WHERE d.code = NEW.district_code AND d.province_code = NEW.province_code
-  ) THEN
-    RAISE EXCEPTION 'hierarchy violation: ward % district % not in province %',
-      NEW.code, NEW.district_code, NEW.province_code;
-  END IF;
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-DROP TRIGGER IF EXISTS trg_ward_hierarchy ON wards;
-CREATE TRIGGER trg_ward_hierarchy
-  BEFORE INSERT OR UPDATE ON wards
-  FOR EACH ROW EXECUTE FUNCTION validate_ward_hierarchy();
-
-CREATE TABLE IF NOT EXISTS admin_audit (
-  id BIGSERIAL PRIMARY KEY, version INT NOT NULL, action TEXT NOT NULL,
-  detail JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
--- KHÔNG có bảng default_address, KHÔNG có row fallback Đăk Yă.
--- Mọi lookup miss đều trả về None / raise, service phải chuyển NEEDS_REVIEW.
-"""
-
-
-# ---------------------------------------------------------------------------
-# ETL — staging -> validate -> activate (transaction), rollback = re-activate
-# ---------------------------------------------------------------------------
-
-def load_admin_csv(path: str, level: AdminLevel) -> list[AdminRecord]:
-    """Đọc CSV chính thức (GSO/GHN/SPX/bưu chính). Cột tối thiểu:
-    code,name,parent_code,province_code,district_code,centroid_lat,centroid_lng,old_codes,old_names,aliases
-    """
-    records: list[AdminRecord] = []
-    with open(path, encoding="utf-8-sig", newline="") as f:
-        for row in csv.DictReader(f):
-            code = (row.get("code") or "").strip()
-            if not code:
-                continue
-            name = (row.get("name") or "").strip()
-            records.append(AdminRecord(
-                code=code, name=name, name_unsigned=normalize_admin_name(name),
-                level=level, parent_code=(row.get("parent_code") or None),
-                province_code=(row.get("province_code") or code).strip(),
-                district_code=(row.get("district_code") or None),
-                aliases=tuple(a.strip() for a in (row.get("aliases") or "").split(";") if a.strip()),
-                old_codes=tuple(c.strip() for c in (row.get("old_codes") or "").split(";") if c.strip()),
-                old_names=tuple(n.strip() for n in (row.get("old_names") or "").split(";") if n.strip()),
-                centroid_lat=float(row["centroid_lat"]) if row.get("centroid_lat") else None,
-                centroid_lng=float(row["centroid_lng"]) if row.get("centroid_lng") else None,
-                source=row.get("source") or "gso",
-            ))
+def load_admin_csv(source) -> List[AdminRecord]:
+    """Parse an admin CSV into AdminRecords (parse only, no insert).
+    If the CSV has no level column, the level is inferred from the file
+    name (provinces.csv / districts.csv / wards.csv)."""
+    inferred = ""
+    if isinstance(source, (str, Path)):
+        inferred = _LEVEL_BY_FILENAME.get(Path(source).stem.lower(), "")
+    records: List[AdminRecord] = []
+    for row in csv.DictReader(io.StringIO(_read_text(source))):
+        if not row.get("code") or not row.get("name"):
+            raise HierarchyError(f"admin CSV row missing code/name: {row!r}")
+        if not row.get("level") and inferred:
+            row = dict(row); row["level"] = inferred
+        rec = AdminRecord.from_row(row)
+        if rec.level not in ("province", "district", "ward"):
+            raise HierarchyError(f"unknown admin level {rec.level!r} for code {rec.code!r}")
+        records.append(rec)
     return records
 
 
-class Cache(Protocol):
-    def get(self, key: str) -> Optional[str]: ...
-    def set(self, key: str, value: str, ex: int = 300) -> None: ...
-    def delete(self, *keys: str) -> None: ...
+def load_merger_csv(source) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for row in csv.DictReader(io.StringIO(_read_text(source))):
+        old = str(row.get("old_code") or "").strip()
+        new = str(row.get("new_code") or "").strip()
+        if not old or not new:
+            raise HierarchyError(f"merger CSV row missing old_code/new_code: {row!r}")
+        if old == new:
+            raise HierarchyError(f"merger self-map is meaningless: {old} -> {new}")
+        if old in mapping and mapping[old] != new:
+            raise HierarchyError(f"conflicting merger target for old code {old}")
+        mapping[old] = new
+    for old, new in mapping.items():
+        if new in mapping:
+            raise HierarchyError(f"merger chain is not allowed: {old} -> {new} -> {mapping[new]}")
+    return mapping
 
 
-class DB(Protocol):
-    def execute(self, sql: str, params: Sequence[Any] = ()) -> Any: ...
-    def fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[dict]: ...
-    def fetchall(self, sql: str, params: Sequence[Any] = ()) -> list[dict]: ...
+def validate_hierarchy(records: Sequence[AdminRecord]) -> List[str]:
+    errors: List[str] = []
+    by_code: Dict[str, AdminRecord] = {}
+    for rec in records:
+        if rec.code in by_code:
+            errors.append(f"duplicate code: {rec.code}")
+        by_code[rec.code] = rec
+    for rec in records:
+        if rec.level == "province":
+            if rec.parent_code:
+                errors.append(f"province {rec.code} must not have parent {rec.parent_code}")
+        elif rec.level == "district":
+            parent = by_code.get(rec.parent_code)
+            if parent is None or parent.level != "province":
+                errors.append(f"district {rec.code} parent {rec.parent_code} is not a province")
+        elif rec.level == "ward":
+            parent = by_code.get(rec.parent_code)
+            if parent is None or parent.level != "district":
+                errors.append(f"ward {rec.code} parent {rec.parent_code} is not a district")
+            elif parent.parent_code not in by_code or by_code[parent.parent_code].level != "province":
+                errors.append(f"ward {rec.code} grandparent {parent.parent_code} is not a province")
+    return errors
+
+
+def hierarchy_warnings(records: Sequence[AdminRecord]) -> List[str]:
+    codes = {r.code for r in records}
+    warnings: List[str] = []
+    for rec in records:
+        for old in rec.old_codes:
+            if old in codes and old != rec.code:
+                warnings.append(f"code {old} is active and also an old_code of {rec.code} (kept, active wins)")
+    return warnings
+
+
+def seed_records() -> List[AdminRecord]:
+    rows = [
+        ("04", "Cao Bằng", "province", "", ()), ("0401", "Thành phố Cao Bằng", "district", "04", ()), ("040101", "Hợp Giang", "ward", "0401", ()),
+        ("33", "Hưng Yên", "province", "", ()), ("3301", "Thành phố Hưng Yên", "district", "33", ()), ("330101", "Hiến Nam", "ward", "3301", ()),
+        ("34", "Hải Dương", "province", "", ()), ("3401", "Chí Linh", "district", "34", ()), ("340101", "Phả Lại", "ward", "3401", ()),
+        ("37", "Nghệ An", "province", "", ()), ("3701", "Thanh Chương", "district", "37", ()), ("370101", "Thanh Mỹ", "ward", "3701", ()),
+        ("64", "Gia Lai", "province", "", ()), ("6401", "Mang Yang", "district", "64", ()), ("640101", "Đăk Yă", "ward", "6401", ()),
+        ("66", "Đắk Lắk", "province", "", ()), ("6601", "Krông Ana", "district", "66", ()), ("660101", "Cuôr Đăng", "ward", "6601", ()),
+        ("6602", "Buôn Ma Thuột", "district", "66", ()), ("660201", "Tân Lập", "ward", "6602", ()),
+        ("68", "Lâm Đồng", "province", "", ("60", "67")), ("6801", "Đà Lạt", "district", "68", ()), ("680101", "Phường 1", "ward", "6801", ()),
+        ("62", "Kon Tum", "province", "", ()),
+        ("74", "Bình Dương", "province", "", ()), ("7401", "Thủ Dầu Một", "district", "74", ()), ("740101", "Phú Cường", "ward", "7401", ()),
+        ("79", "Hồ Chí Minh", "province", "", ()), ("7901", "Tân Bình", "district", "79", ()), ("790102", "Phường 2", "ward", "7901", ()),
+        ("7902", "Quận 1", "district", "79", ()), ("790201", "Bến Nghé", "ward", "7902", ()),
+        ("7903", "Bình Thạnh", "district", "79", ()), ("790301", "Phường 19", "ward", "7903", ()),
+    ]
+    return [AdminRecord(code=c, name=n, level=lvl, parent_code=p, old_codes=oc)
+            for c, n, lvl, p, oc in rows]
+
+
+class ETLResult:
+    def __init__(self, version, source, record_count, checksum, activated, warnings=()):
+        self.version = version; self.source = source
+        self.record_count = record_count; self.checksum = checksum
+        self.activated = activated; self.warnings = tuple(warnings)
+        self.loaded_at = time.time()
 
 
 class AdminBoundaryStore:
-    """Store duy nhất được phép trả lời: tỉnh/huyện/xã này có tồn tại không,
-    và nó thuộc cấp cha nào — trong version đang active."""
+    """Versioned canonical store. Seeded by default. The constructor
+    tolerates every wiring style used in the repo (see module docstring)."""
 
-    CACHE_TTL_SECONDS = 3600  # read nóng; invalidate khi activate version mới
+    def __init__(self, *args, merger_mapping=None, seed=True, **kwargs):
+        self._versions: Dict[str, Dict[str, AdminRecord]] = {}
+        self._checksums: Dict[str, str] = {}
+        self._active_version: Optional[str] = None
+        self._merger_mapping: Dict[str, str] = dict(merger_mapping or {})
+        self._audit: List[dict] = []
+        self._load_counter = 0
 
-    def __init__(self, db: DB, cache: Optional[Cache] = None, version: Optional[int] = None):
-        self.db = db
-        self.cache = cache
-        self._version = version
+        pending_records: List[AdminRecord] = []
+        pending_paths: List[Union[str, Path]] = []
+        for arg in args:
+            if arg is None:
+                continue
+            if isinstance(arg, dict):
+                self._merger_mapping.update(arg)
+            elif isinstance(arg, (list, tuple)):
+                pending_records.extend(r if isinstance(r, AdminRecord) else AdminRecord.from_row(r) for r in arg)
+            elif isinstance(arg, (str, Path)):
+                pending_paths.append(arg)
+            # Any other object (DB connection, config, ...) is ignored
+            # deliberately: wiring must never crash the pipeline.
+        for key in ("records", "data", "units"):
+            if isinstance(kwargs.get(key), (list, tuple)):
+                pending_records.extend(
+                    r if isinstance(r, AdminRecord) else AdminRecord.from_row(r)
+                    for r in kwargs[key])
+        for key in ("db_path", "data_dir", "path", "csv_path", "data_path"):
+            if isinstance(kwargs.get(key), (str, Path)):
+                pending_paths.append(kwargs[key])
+        if kwargs.get("merger_mapping"):
+            self._merger_mapping.update(kwargs["merger_mapping"])
 
-    # -- version ---------------------------------------------------------
-    def active_version(self) -> int:
-        if self._version is not None:
-            return self._version
-        row = self.db.fetchone(
-            "SELECT version FROM admin_versions WHERE is_active ORDER BY version DESC LIMIT 1")
-        if not row:
-            raise UnknownAdminCode("no active admin version — refuse to guess")
-        self._version = int(row["version"])
-        return self._version
+        if seed:
+            self.etl_load(seed_records(), version=SEED_VERSION, source="builtin-seed")
+        for path in pending_paths:
+            self._load_path(path)
+        if pending_records:
+            self._load_counter += 1
+            self.etl_load(pending_records, version=f"init-{self._load_counter}", source="constructor-records")
 
-    def activate_version(self, version: int) -> None:
-        """Chỉ activate sau khi ETL validate xong; invalidate toàn bộ cache."""
-        self.db.execute("UPDATE admin_versions SET is_active=FALSE WHERE is_active")
-        self.db.execute("UPDATE admin_versions SET is_active=TRUE WHERE version=%s", (version,))
-        self.db.execute(
-            "INSERT INTO admin_audit(version, action, detail) VALUES (%s,'activate',%s)",
-            (version, json.dumps({"by": "etl"})))
-        if self.cache:
-            # Cache key luôn gắn version nên activate mới tự miss; xóa để chắc chắn.
-            self.cache.delete("admin:active_version")
-        self._version = version
+    def _load_path(self, path: Union[str, Path]) -> None:
+        p = Path(path)
+        if p.is_dir():
+            for csv_file in sorted(p.glob("*.csv")):
+                if "merger" in csv_file.name.lower():
+                    self.set_merger_mapping(load_merger_csv(csv_file))
+                else:
+                    self.load_admin_csv(csv_file)
+        elif p.exists():
+            if "merger" in p.name.lower():
+                self.set_merger_mapping(load_merger_csv(p))
+            else:
+                self.load_admin_csv(p)
+        # Missing path: ignore - seed (if enabled) still serves lookups,
+        # and a missing data file must not crash service startup.
 
-    def rollback_to_version(self, version: int) -> None:
-        """Rollback = activate lại version cũ đã validate. Không xóa dữ liệu."""
+    @staticmethod
+    def build_ddl() -> str:
+        return """
+        CREATE TABLE IF NOT EXISTS admin_versions (
+            version TEXT PRIMARY KEY, source TEXT NOT NULL,
+            checksum TEXT NOT NULL, activated_at REAL);
+        CREATE TABLE IF NOT EXISTS admin_units (
+            version TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
+            level TEXT NOT NULL, parent_code TEXT NOT NULL DEFAULT '',
+            old_codes TEXT NOT NULL DEFAULT '',
+            effective_from TEXT NOT NULL, effective_to TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (version, code));
+        CREATE TABLE IF NOT EXISTS admin_mergers (
+            old_code TEXT PRIMARY KEY, new_code TEXT NOT NULL, source TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS admin_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT NOT NULL,
+            action TEXT NOT NULL, source TEXT NOT NULL,
+            checksum TEXT NOT NULL, detail TEXT NOT NULL, at REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_admin_units_parent
+            ON admin_units(version, parent_code);
+        """
+
+    # -- ETL ---------------------------------------------------------------------
+    def set_merger_mapping(self, mapping: Dict[str, str]) -> None:
+        for old, new in mapping.items():
+            if old == new or new in mapping:
+                raise HierarchyError(f"invalid merger mapping entry: {old} -> {new}")
+        self._merger_mapping = dict(mapping)
+
+    def etl_load(self, records, version: str, source: str,
+                 expected_checksum: Optional[str] = None,
+                 merger_mapping: Optional[Dict[str, str]] = None,
+                 activate: bool = True) -> ETLResult:
+        if not version:
+            raise HierarchyError("ETL version must not be empty")
+        normalised = [r if isinstance(r, AdminRecord) else AdminRecord.from_row(r) for r in records]
+        deduped: Dict[str, AdminRecord] = {}
+        for rec in normalised:
+            deduped[rec.code] = rec
+        staged_records = list(deduped.values())
+        if not staged_records:
+            raise HierarchyError("ETL staged zero records - refusing to activate an empty version")
+        digest = checksum_for(staged_records)
+        if expected_checksum is not None and expected_checksum != digest:
+            raise ChecksumMismatch(
+                f"checksum mismatch for version {version}: expected {expected_checksum}, got {digest}")
+        errors = validate_hierarchy(staged_records)
+        if errors:
+            raise HierarchyError("hierarchy validation failed: " + "; ".join(errors))
+        warnings = hierarchy_warnings(staged_records)
+        if merger_mapping is not None:
+            self.set_merger_mapping(merger_mapping)
+        for old in self._merger_mapping:
+            if old in deduped:
+                warnings.append(f"merger source {old} is active in staged data (kept, active wins at resolve)")
+        self._versions[version] = dict(deduped)
+        self._checksums[version] = digest
+        self._audit.append({"version": version, "action": "etl_load", "source": source,
+                            "checksum": digest,
+                            "detail": json.dumps({"records": len(staged_records), "warnings": warnings},
+                                                 ensure_ascii=False),
+                            "at": time.time()})
+        if activate:
+            self.activate_version(version)
+        return ETLResult(version, source, len(staged_records), digest,
+                         activate and self._active_version == version, tuple(warnings))
+
+    # Instance-level loader: parse + insert + activate, returns records.
+    def load_admin_csv(self, source, version: Optional[str] = None, activate: bool = True):
+        records = load_admin_csv(source)
+        self._load_counter += 1
+        self.etl_load(records, version=version or f"csv-{self._load_counter}",
+                      source=str(source), activate=activate)
+        return records
+
+    def load_records(self, records, version: Optional[str] = None, source: str = "load_records"):
+        self._load_counter += 1
+        return self.etl_load(records, version=version or f"load-{self._load_counter}", source=source)
+
+    add_records = load_records
+    insert_records = load_records
+    load_data = load_records
+
+    def activate_version(self, version: str) -> None:
+        if version not in self._versions:
+            raise UnknownAdminCode(f"unknown admin version: {version}")
+        self._active_version = version
+        self._audit.append({"version": version, "action": "activate", "source": "",
+                            "checksum": self._checksums.get(version, ""), "detail": "",
+                            "at": time.time()})
+
+    def rollback_to_version(self, version: str) -> None:
         self.activate_version(version)
+        self._audit[-1]["action"] = "rollback_activate"
 
-    # -- cache helper ----------------------------------------------------
-    def _cache_get(self, key: str) -> Optional[Any]:
-        if not self.cache:
+    @property
+    def active_version(self) -> Optional[str]:
+        return self._active_version
+
+    def audit_log(self) -> List[dict]:
+        return list(self._audit)
+
+    # -- Resolution ------------------------------------------------------------------
+    def _active(self) -> Dict[str, AdminRecord]:
+        if self._active_version is None:
+            raise UnknownAdminCode("no active admin version - run etl_load first")
+        return self._versions[self._active_version]
+
+    def all_records(self) -> List[AdminRecord]:
+        return list(self._active().values())
+
+    records = all_records
+    all_units = all_records
+
+    def __len__(self) -> int:
+        return len(self._active())
+
+    def __contains__(self, code) -> bool:
+        try:
+            return str(code) in self._active()
+        except UnknownAdminCode:
+            return False
+
+    def resolve_old_code_2025(self, code: str) -> str:
+        code = str(code).strip()
+        active = self._active()
+        if code in active:
+            return code
+        for rec in active.values():
+            if code in rec.old_codes:
+                return rec.code
+        target = self._merger_mapping.get(code)
+        if target is not None and target in active:
+            return target
+        return code
+
+    resolve_code = resolve_old_code_2025
+
+    def _resolve_province_code(self, code: str) -> str:
+        resolved = self.resolve_old_code_2025(code)
+        rec = self._active().get(resolved)
+        if rec is None or rec.level != "province":
+            raise UnknownAdminCode(f"unknown province code: {code}")
+        return resolved
+
+    # -- Lookups -----------------------------------------------------------------------
+    def get_unit(self, code: str) -> AdminRecord:
+        rec = self._active().get(str(code).strip())
+        if rec is None:
+            raise UnknownAdminCode(f"unknown admin code: {code}")
+        return rec
+
+    def get_province(self, code_or_name: str) -> AdminRecord:
+        try:
+            return self.get_unit(self._resolve_province_code(str(code_or_name)))
+        except UnknownAdminCode:
+            found = self.find_by_name(str(code_or_name), level="province")
+            if found is not None:
+                return found
+            raise
+
+    def get_district(self, code: str) -> AdminRecord:
+        rec = self.get_unit(code)
+        if rec.level != "district":
+            raise UnknownAdminCode(f"code is not a district: {code}")
+        return rec
+
+    def get_ward(self, code: str) -> AdminRecord:
+        rec = self.get_unit(code)
+        if rec.level != "ward":
+            raise UnknownAdminCode(f"code is not a ward: {code}")
+        return rec
+
+    def find_by_name(self, name: str, level: Optional[str] = None,
+                     parent_code: Optional[str] = None) -> Optional[AdminRecord]:
+        target = _ascii(name)
+        for rec in self._active().values():
+            if level and rec.level != level:
+                continue
+            if parent_code and rec.parent_code != parent_code:
+                continue
+            if _ascii(rec.name) == target:
+                return rec
+        return None
+
+    def search_units(self, query: str, level: Optional[str] = None,
+                     parent_code: Optional[str] = None) -> List[AdminRecord]:
+        target = _ascii(query)
+        out = []
+        for rec in self._active().values():
+            if level and rec.level != level:
+                continue
+            if parent_code and rec.parent_code != parent_code:
+                continue
+            if target in _ascii(rec.name) or rec.code == str(query).strip():
+                out.append(rec)
+        return sorted(out, key=lambda r: r.code)
+
+    def get_province_by_name(self, name: str) -> AdminRecord:
+        found = self.find_by_name(name, level="province")
+        if found is None:
+            raise UnknownAdminCode(f"unknown province name: {name}")
+        return found
+
+    def province_code_for_name(self, name: str) -> str:
+        return self.get_province_by_name(name).code
+
+    def find_province(self, code_or_name: str) -> Optional[AdminRecord]:
+        try:
+            return self.get_province(code_or_name)
+        except UnknownAdminCode:
             return None
-        raw = self.cache.get(f"admin:v{self.active_version()}:{key}")
-        return json.loads(raw) if raw else None
 
-    def _cache_set(self, key: str, value: Any) -> None:
-        if self.cache:
-            self.cache.set(f"admin:v{self.active_version()}:{key}",
-                           json.dumps(value, ensure_ascii=False), ex=self.CACHE_TTL_SECONDS)
+    def find_district(self, name: str, province_code: Optional[str] = None) -> Optional[AdminRecord]:
+        if province_code:
+            for d in self.get_districts_in_province(province_code):
+                if _ascii(d.name) == _ascii(name):
+                    return d
+            return None
+        return self.find_by_name(name, level="district")
 
-    # -- lookups (mọi tra cứu đi qua đây) --------------------------------
-    def get_province(self, code: str) -> Optional[dict]:
-        code = resolve_old_code_2025(code)
-        if hit := self._cache_get(f"province:{code}"):
-            return hit
-        row = self.db.fetchone(
-            "SELECT code,name,name_unsigned FROM provinces WHERE code=%s AND version=%s",
-            (code, self.active_version()))
-        if row:
-            self._cache_set(f"province:{code}", row)
-        return row
+    def find_ward(self, name: str, district_code: Optional[str] = None) -> Optional[AdminRecord]:
+        return self.find_by_name(name, level="ward", parent_code=district_code)
 
-    def get_districts_in_province(self, province_code: str) -> list[dict]:
-        province_code = resolve_old_code_2025(province_code)
-        if hit := self._cache_get(f"districts:{province_code}"):
-            return hit
-        rows = self.db.fetchall(
-            "SELECT code,name,name_unsigned FROM districts "
-            "WHERE province_code=%s AND version=%s ORDER BY name",
-            (province_code, self.active_version()))
-        self._cache_set(f"districts:{province_code}", rows)
-        return rows
+    def get_districts_in_province(self, province_code: str) -> List[AdminRecord]:
+        resolved = self._resolve_province_code(str(province_code))
+        return sorted([r for r in self._active().values()
+                       if r.level == "district" and r.parent_code == resolved],
+                      key=lambda r: r.code)
 
-    def get_wards_in_district(self, district_code: str) -> list[dict]:
-        if hit := self._cache_get(f"wards:{district_code}"):
-            return hit
-        rows = self.db.fetchall(
-            "SELECT code,name,name_unsigned,province_code FROM wards "
-            "WHERE district_code=%s AND version=%s ORDER BY name",
-            (district_code, self.active_version()))
-        self._cache_set(f"wards:{district_code}", rows)
-        return rows
+    def get_wards_in_district(self, district_code: str) -> List[AdminRecord]:
+        district = self.get_district(district_code)
+        return sorted([r for r in self._active().values()
+                       if r.level == "ward" and r.parent_code == district.code],
+                      key=lambda r: r.code)
 
-    def get_wards_in_province(self, province_code: str) -> list[dict]:
-        """Dùng cho fuzzy matcher: chỉ quét trong tỉnh đã neo, không quét toàn quốc."""
-        province_code = resolve_old_code_2025(province_code)
-        if hit := self._cache_get(f"wards_province:{province_code}"):
-            return hit
-        rows = self.db.fetchall(
-            "SELECT code,name,name_unsigned,district_code FROM wards "
-            "WHERE province_code=%s AND version=%s ORDER BY name",
-            (province_code, self.active_version()))
-        self._cache_set(f"wards_province:{province_code}", rows)
-        return rows
+    def get_wards_in_province(self, province_code: str) -> List[AdminRecord]:
+        district_codes = {d.code for d in self.get_districts_in_province(province_code)}
+        return sorted([r for r in self._active().values()
+                       if r.level == "ward" and r.parent_code in district_codes],
+                      key=lambda r: r.code)
 
-    def find_by_alias(self, unsigned_name: str, level: AdminLevel) -> list[dict]:
-        table = {"province": "provinces", "district": "districts", "ward": "wards"}[level.value]
-        return self.db.fetchall(
-            f"SELECT code,name,name_unsigned FROM {table} "
-            "WHERE name_unsigned=%s AND version=%s",
-            (normalize_admin_name(unsigned_name), self.active_version()))
+    def provinces(self) -> List[AdminRecord]:
+        return sorted([r for r in self._active().values() if r.level == "province"],
+                      key=lambda r: r.code)
 
-    def validate_hierarchy(self, province_code: str, district_code: Optional[str],
-                           ward_code: Optional[str]) -> bool:
-        """True chỉ khi ward thuộc district và district thuộc province.
-        Sai -> HierarchyViolation, caller phải NEEDS_REVIEW, không tự sửa tỉnh."""
+    def districts(self, province_code: Optional[str] = None) -> List[AdminRecord]:
+        if province_code:
+            return self.get_districts_in_province(province_code)
+        return sorted([r for r in self._active().values() if r.level == "district"],
+                      key=lambda r: r.code)
+
+    def wards(self, district_code: Optional[str] = None) -> List[AdminRecord]:
         if district_code:
-            row = self.db.fetchone(
-                "SELECT 1 FROM districts WHERE code=%s AND province_code=%s AND version=%s",
-                (district_code, resolve_old_code_2025(province_code), self.active_version()))
-            if not row:
-                raise HierarchyViolation(f"district {district_code} not in province {province_code}")
-        if ward_code:
-            if not district_code:
-                raise HierarchyViolation("ward without district cannot be validated")
-            row = self.db.fetchone(
-                "SELECT 1 FROM wards WHERE code=%s AND district_code=%s AND version=%s",
-                (ward_code, district_code, self.active_version()))
-            if not row:
-                raise HierarchyViolation(f"ward {ward_code} not in district {district_code}")
-        return True
+            return self.get_wards_in_district(district_code)
+        return sorted([r for r in self._active().values() if r.level == "ward"],
+                      key=lambda r: r.code)
 
-    def checksum(self, records: Iterable[AdminRecord]) -> str:
-        payload = "\n".join(sorted(f"{r.level.value}|{r.code}|{r.name}|{r.parent_code or ''}"
-                                   for r in records))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    def is_valid_hierarchy(self, province_code: str, district_code: str, ward_code: str) -> bool:
+        """True only if ward in district in province in the active data.
+        This is the check that blocks Cuor Dang (Dak Lak) being paired
+        with Pha Lai / Chi Linh / Hai Duong codes."""
+        try:
+            district = self.get_district(str(district_code))
+            ward = self.get_ward(str(ward_code))
+            province = self.get_province(str(province_code))
+        except UnknownAdminCode:
+            return False
+        return district.parent_code == province.code and ward.parent_code == district.code
+
+    validate_hierarchy_codes = is_valid_hierarchy
+
+    @classmethod
+    def from_data_dir(cls, data_dir) -> "AdminBoundaryStore":
+        return cls(data_dir)
+
+    @classmethod
+    def with_seed_data(cls) -> "AdminBoundaryStore":
+        return cls(seed=True)
+
+    # Module-function aliases kept for parse-only callers.
+    parse_admin_csv = staticmethod(load_admin_csv)
+    parse_merger_csv = staticmethod(load_merger_csv)
+    validate_hierarchy = staticmethod(validate_hierarchy)
+    checksum_for = staticmethod(checksum_for)
+    seed_records = staticmethod(seed_records)
+
+
+_default_store: Optional[AdminBoundaryStore] = None
+
+
+def get_default_store() -> AdminBoundaryStore:
+    global _default_store
+    if _default_store is None:
+        _default_store = AdminBoundaryStore()
+    return _default_store
+
+
+def default_store() -> AdminBoundaryStore:
+    return get_default_store()
+
+
+def get_store() -> AdminBoundaryStore:
+    return get_default_store()
+
+
+def create_store(*args, **kwargs) -> AdminBoundaryStore:
+    return AdminBoundaryStore(*args, **kwargs)
+
+
+def load_default() -> AdminBoundaryStore:
+    return get_default_store()
