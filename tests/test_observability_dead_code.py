@@ -5,13 +5,17 @@ Chưa chạy trong phiên này (KHÔNG_CHẠY_LỆNH); CI chạy:
     python -m pytest tests/test_observability_dead_code.py -v
 
 Bao phủ:
-1) Mã nguồn không còn tên chết `regionLock` và __init__ chỉ gán
-   region_lock đúng một lần; Observability giữ đúng object được truyền.
+1) Kiểm tra bằng AST (không quét chuỗi thô — bản test trước tự bắt phải
+   chữ trong docstring/comment mô tả lỗi cũ): cây cú pháp của
+   observability.py không còn node tên của biến chết, và phép gán thuộc
+   tính region_lock lên self xuất hiện đúng 1 lần trong code thật.
+   Observability giữ đúng object lock được truyền vào.
 2) forbidden_default_rate tính theo SỐ CA vi phạm: một ca trúng cả hai
    mảnh chuỗi cấm ('Đăk Yă' và 'Mang Yang') vẫn chỉ tính 1 ca — tỉ lệ
    không bao giờ vượt 1.0 (bản cũ chia theo số lượt trúng).
 3) Ca sạch -> rate 0 và passed True.
 """
+import ast
 import inspect
 from pathlib import Path
 
@@ -30,8 +34,21 @@ SOURCE = (
 
 
 def test_no_dead_region_lock_code():
-    assert "regionLock" not in SOURCE
-    assert SOURCE.count("self.region_lock =") == 1
+    tree = ast.parse(SOURCE)
+    # Không còn node Name nào mang tên biến chết trong code thật
+    # (docstring/comment không tạo node Name nên không gây đỏ giả).
+    name_ids = {node.id for node in ast.walk(tree)
+                if isinstance(node, ast.Name)}
+    assert "regionLock" not in name_ids
+    # Phép gán self.region_lock xuất hiện đúng 1 lần trong code thật.
+    assignments = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Attribute) and t.attr == "region_lock"
+                and isinstance(t.value, ast.Name) and t.value.id == "self"
+                for t in node.targets)
+    ]
+    assert len(assignments) == 1
 
 
 def test_observability_keeps_passed_region_lock():

@@ -202,8 +202,8 @@ class Observability:
 
     def __init__(self, region_lock: Optional[threading.Lock] = None,
                  **_ignored) -> None:
-        # Một lần gán duy nhất — bản cũ có thêm dòng chết tham chiếu tên
-        # `regionLock` không tồn tại rồi gán đè ngay sau; đã xóa.
+        # Một lần gán duy nhất — bản cũ có thêm dòng chết tham chiếu một
+        # tên không tồn tại rồi gán đè ngay sau; đã xóa.
         self.region_lock = region_lock
         self._lock = threading.Lock()
         self._decision_counts: Counter = Counter()
