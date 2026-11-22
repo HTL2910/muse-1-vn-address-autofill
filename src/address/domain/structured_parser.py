@@ -1,4 +1,6 @@
-"""Structured parser — approach_04, canonical."""
+"""Structured parser — approach_04, canonical.
+Ghi lại nguồn của mỗi cấp (prefix / bare-segment) để guard có thể
+kiểm chứng bằng chứng, không đếm tên nằm trong đoạn đường."""
 from __future__ import annotations
 import re
 from dataclasses import dataclass, field
@@ -14,6 +16,8 @@ class ParsedAddress:
     raw_input: str; normalized: str=""; house_number: str=""; street: str=""; hamlet: str=""
     ward_name: str=""; district_name: str=""; province_name: str=""
     tokens: list[str]=field(default_factory=list); matched_tokens: list[str]=field(default_factory=list); unmatched_tokens: list[str]=field(default_factory=list)
+    # Nguồn chứng cứ: "prefix" | "bare_segment" | "" (không có).
+    province_source: str=""; district_source: str=""; ward_source: str=""
     @property
     def admin_level_count(self) -> int: return sum(bool(x) for x in [self.province_name, self.district_name, self.ward_name])
 def parse_address(raw_input: str) -> ParsedAddress:
@@ -24,20 +28,24 @@ def parse_address(raw_input: str) -> ParsedAddress:
     unclassified: list[str]=[]
     for seg in segments:
         prefix, rest=_strip_prefix(seg)
-        if prefix in ("tỉnh","thành phố","tp","tp."): parsed.province_name=rest
-        elif prefix in ("quận","huyện","thị trấn","tt","tt."): parsed.district_name=rest
-        elif prefix in ("xã","phường"): parsed.ward_name=rest
+        if prefix in ("tỉnh","thành phố","tp","tp."): parsed.province_name=rest; parsed.province_source="prefix"
+        elif prefix in ("quận","huyện","thị trấn","tt","tt."): parsed.district_name=rest; parsed.district_source="prefix"
+        elif prefix in ("xã","phường"): parsed.ward_name=rest; parsed.ward_source="prefix"
         elif prefix in ("thôn","xóm"): parsed.hamlet=rest
         elif prefix in ("đường","ngõ","hẻm"): parsed.street=rest
         else: unclassified.append(seg)
     if unclassified:
+        # Chỉ gán cấp hành chính từ đoạn trần KHÔNG có số nhà và
+        # không phải tên đường; đoạn cuối là tỉnh, đoạn trước là
+        # huyện/xã theo thứ tự từ phải sang trái.
         rev=list(reversed(unclassified))
-        if len(rev)>=1 and not parsed.province_name and len(segments)>=2 and not re.search(r"\d", rev[0]):
-            parsed.province_name=_strip_prefix(rev[0])[1]; rev=rev[1:]
-        if rev and not parsed.district_name and len(segments)>=3 and not re.search(r"\d", rev[0]):
-            parsed.district_name=_strip_prefix(rev[0])[1]; rev=rev[1:]
-        if rev and not parsed.ward_name and len(segments)>=3 and not re.search(r"\d", rev[0]):
-            parsed.ward_name=_strip_prefix(rev[0])[1]; rev=rev[1:]
+        bare=[s for s in rev if not re.search(r"\d", s) and normalize_text(s) not in ("",)]
+        if bare and not parsed.province_name and len(segments)>=2:
+            parsed.province_name=_strip_prefix(bare[0])[1]; parsed.province_source="bare_segment"; bare=bare[1:]
+        if bare and not parsed.district_name and len(segments)>=3:
+            parsed.district_name=_strip_prefix(bare[0])[1]; parsed.district_source="bare_segment"; bare=bare[1:]
+        if bare and not parsed.ward_name and len(segments)>=3:
+            parsed.ward_name=_strip_prefix(bare[0])[1]; parsed.ward_source="bare_segment"; bare=bare[1:]
         for seg in rev:
             m=_HOUSE_RE.match(seg.strip())
             if m and not parsed.house_number:

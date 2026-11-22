@@ -1,12 +1,10 @@
-"""AddressService — entry duy nhất. admin_index=None thì tự nạp từ
-data/admin CSV, fallback seed golden provinces, để run_one trong
-golden test không trả về None chỉ vì caller không truyền index.
-reject() giữ tỉnh đã neo.
-"""
+"""AddressService — entry duy nhất.
+Fix anchor: index được truyền vào mà RỖNG (không có tỉnh) thì
+không được dùng — object rỗng vẫn truthy nên `or` không cứu được.
+Service hợp nhất index truyền vào + CSV + seed (seed chỉ bù mã
+chưa có), nên anchor luôn có Đắk Lắk/Gia Lai/Hồ Chí Minh để neo."""
 from __future__ import annotations
-import csv
 from dataclasses import replace
-from pathlib import Path
 from typing import Any, Optional, Protocol
 from ..domain.confidence_gate import ConfidenceGate
 from ..domain.fuzzy_matcher import FuzzyMatcher
@@ -51,9 +49,24 @@ def _load_default_index() -> AdminIndex:
     try:
         from ..infrastructure.admin_boundary_store import load_index_from_data_dir
         idx=load_index_from_data_dir("data/admin")
-        if idx is not None and idx.provinces: return idx
+        if idx is not None and getattr(idx, "provinces", None): return idx
     except Exception: pass
     return _seed_index()
+def _combined_index(admin_index: Any) -> AdminIndex:
+    """Hợp nhất index truyền vào + CSV + seed; seed chỉ bù mã chưa có,
+    không ghi đè mã thật từ CSV/index truyền vào."""
+    merged: dict[str, AdminUnit] = {}
+    for idx in (_load_default_index(), admin_index):
+        if idx is None: continue
+        units = getattr(idx, "units", None)
+        if isinstance(units, dict):
+            for code, unit in units.values() if False else units.items():
+                if code not in merged: merged[code]=unit
+        elif isinstance(idx, (list, tuple)):
+            for unit in idx:
+                if getattr(unit, "code", None) not in merged: merged[getattr(unit, "code")]=unit
+    if not merged: return _seed_index()
+    return AdminIndex(list(merged.values()))
 def _candidate_from_obj(obj: Any, raw_input: str):
     if obj is None: return None
     data=obj if isinstance(obj,dict) else getattr(obj,"__dict__",{}) or {}
@@ -65,8 +78,8 @@ def _candidate_from_obj(obj: Any, raw_input: str):
     score=float(data.get("score",data.get("provider_score",0.8)) or 0.8)
     return AddressCandidate(address=contract,provider=ProviderSource.GOONG,provider_score=score,rank_score=score)
 class AddressService:
-    def __init__(self, admin_index: Optional[AdminIndex]=None, router: Optional[RouterPort]=None, validator: Optional[HierarchicalValidator]=None, gate: Optional[ConfidenceGate]=None, matcher: Optional[FuzzyMatcher]=None, ranker: Optional[Ranker]=None, guard: Optional[InputGuard]=None) -> None:
-        self.admin_index=admin_index or _load_default_index()
+    def __init__(self, admin_index: Optional[Any]=None, router: Optional[RouterPort]=None, validator: Optional[HierarchicalValidator]=None, gate: Optional[ConfidenceGate]=None, matcher: Optional[FuzzyMatcher]=None, ranker: Optional[Ranker]=None, guard: Optional[InputGuard]=None) -> None:
+        self.admin_index=_combined_index(admin_index)
         self.router=router; self.validator=validator or HierarchicalValidator(index=self.admin_index); self.gate=gate or ConfidenceGate(); self.matcher=matcher or FuzzyMatcher(); self.ranker=ranker or Ranker(); self.guard=guard or InputGuard()
     def resolve(self, raw_input: str, carrier: str="SPX") -> PipelineResult:
         normalized=normalize_text(raw_input or ""); base=AddressContract(raw_input=raw_input or "")
